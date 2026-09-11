@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    working_dir: /app/backend
+    environment:
+      DATABASE_URL: sqlite:///./leadpilot_local.db
+      FRONTEND_ORIGIN: http://localhost:5173
+      TOKEN_ENCRYPTION_KEY: leadpilot-local-dev-key-change-me
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app/frontend
+    command: sh -lc "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app/frontend
+    environment:
+      VITE_API_URL: http://localhost:8000
