@@ -21,6 +21,12 @@ class SecretStoreTests(unittest.TestCase):
         self.assertEqual(secret, store.decrypt(encrypted))
         self.assertIn("...", store.mask("super-long-secret-value"))
 
+    def test_secret_key_is_stable_without_env(self):
+        first = SecretStore("test-key")
+        second = SecretStore("test-key")
+        secret = "abc-123"
+        self.assertEqual(secret, second.decrypt(first.encrypt(secret)))
+
     def test_voice_provider_status(self):
         config = VoiceAgentConfig(name="Local agent", base_url="http://localhost:9000", enabled=True)
         self.assertEqual("CONNECTED", LocalVoiceAgentProvider(config).status)

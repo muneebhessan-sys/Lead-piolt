@@ -2,7 +2,10 @@ import base64, json, uuid
 from datetime import datetime, timezone
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from app.config import settings
@@ -18,6 +21,27 @@ from app.services.voice import LocalVoiceAgentProvider
 
 app = FastAPI(title="LeadPilot API", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=[settings.frontend_origin], allow_methods=["*"], allow_headers=["*"])
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail, "path": request.url.path, "status_code": exc.status_code})
+
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail, "path": request.url.path, "status_code": exc.status_code})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"error": "VALIDATION_ERROR", "path": request.url.path, "status_code": 422, "details": exc.errors()})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"error": "INTERNAL_SERVER_ERROR", "path": request.url.path, "status_code": 500})
+
+
 jobs = LocalJobEngine()
 
 class InstructionIn(BaseModel):
@@ -53,8 +77,15 @@ async def request_id(request:Request, call_next):
     finally:
         db=SessionLocal();db.add(AuditLog(action=f"{request.method} {request.url.path}",subsystem="API",result=locals().get("result","ERROR"),request_id=request_id,safe_error=locals().get("safe_error","")));db.commit();db.close()
     response.headers["X-Request-ID"]=request_id; return response
+@app.get("/healthz")
+def healthz(): return {"status":"OK","service":"leadpilot","database":"SQLITE"}
+
 @app.get("/api/v1/health")
 def health(): return {"status":"WORKING","database":"SQLITE","jobs":"LOCAL_PERSISTENT","dry_run":settings.dry_run,"ai":"DETERMINISTIC_LOCAL"}
+
+@app.get("/api/v1/healthz")
+def healthz_api(): return {"status":"OK","service":"leadpilot","database":"SQLITE"}
+
 @app.post("/api/v1/audits")
 async def audit(payload:dict):
     if not isinstance(payload.get("url"),str): raise HTTPException(422,detail="url is required")
