@@ -12,6 +12,7 @@ from app.services.audit import audit_website
 from app.services.intelligence import IntelligenceEngine
 from app.services.jobs import LocalJobEngine
 from app.services.google_places import GooglePlacesError, GooglePlacesProvider, normalize_place
+from app.services.message_composer import MessageComposerEngine
 from app.services.security import secret_store
 from app.services.voice import LocalVoiceAgentProvider
 
@@ -352,6 +353,60 @@ def save_service_profile(data:ServiceIn,db:Session=Depends(get_db)):
     item=db.query(ServiceProfile).first() or ServiceProfile()
     for key,value in data.model_dump().items():setattr(item,key,value)
     db.add(item);db.commit();db.refresh(item);return item
+@app.get("/api/v1/admin/instructions/{profile_id}/test")
+def test_instruction_profile(profile_id:int, db:Session=Depends(get_db)):
+    profile = db.get(InstructionProfile, profile_id)
+    if not profile: raise HTTPException(404, detail="Instruction profile not found")
+    composer = MessageComposerEngine()
+    draft = composer.compose(
+        profile=profile,
+        business_name="Sample Business",
+        offer=profile.offer or "Conversion-focused local outreach",
+        service_summary=profile.services or "Website + conversion support",
+        cta=profile.cta or "Book a quick strategy call",
+        evidence=["Public business profile reviewed", "Website information available"],
+        tone=profile.tone,
+        niche=profile.niche,
+    )
+    return {"profile_id": profile.id, "subject": draft.subject, "body": draft.body, "status": "READY"}
+
+
+@app.post("/api/v1/admin/instructions/{profile_id}/activate")
+def activate_instruction_profile(profile_id:int, db:Session=Depends(get_db)):
+    profile = db.get(InstructionProfile, profile_id)
+    if not profile: raise HTTPException(404, detail="Instruction profile not found")
+    for row in db.query(InstructionProfile).all():
+        row.active = row.id == profile_id
+    db.commit()
+    profile.active = True
+    db.commit()
+    return {"id": profile.id, "active": True, "name": profile.name}
+
+
+@app.post("/api/v1/admin/instructions/{profile_id}/duplicate")
+def duplicate_instruction_profile(profile_id:int, db:Session=Depends(get_db)):
+    profile = db.get(InstructionProfile, profile_id)
+    if not profile: raise HTTPException(404, detail="Instruction profile not found")
+    clone = InstructionProfile(
+        name=f"{profile.name} Copy",
+        niche=profile.niche,
+        language=profile.language,
+        tone=profile.tone,
+        offer=profile.offer,
+        services=profile.services,
+        cta=profile.cta,
+        rules=profile.rules,
+        do_not_say=profile.do_not_say,
+        personalization_rules=profile.personalization_rules,
+        additional_instructions=profile.additional_instructions,
+        active=False,
+    )
+    db.add(clone)
+    db.commit()
+    db.refresh(clone)
+    return clone
+
+
 @app.post("/api/v1/leads/{lead_id}/messages",status_code=201)
 def create_draft(lead_id:int,data:DraftIn,db:Session=Depends(get_db)):
     lead=db.get(Lead,lead_id)
@@ -359,9 +414,21 @@ def create_draft(lead_id:int,data:DraftIn,db:Session=Depends(get_db)):
     profile=db.get(InstructionProfile,data.instruction_profile_id) if data.instruction_profile_id else db.query(InstructionProfile).filter_by(active=True).first()
     service=db.query(ServiceProfile).first(); audit=db.query(WebsiteAudit).filter_by(business_id=lead.business_id).first()
     evidence=json.loads(audit.evidence).get("reasons",[]) if audit else json.loads(lead.score_reasons)
-    instruction=" ".join(filter(None,[service.company_name if service else "",service.description if service else "",service.services if service else "",service.offer if service else "",service.cta if service else "",service.preferred_tone if service else "",service.additional_instructions if service else "",profile.offer if profile else "",profile.cta if profile else "",profile.additional_instructions if profile else ""]))
-    content=IntelligenceEngine().compose(lead.business.business_name,evidence,instruction or "We would like to discuss a relevant improvement.")
-    message=Message(lead_id=lead.id,instruction_profile_id=profile.id if profile else None,channel=data.channel,recipient=data.recipient,subject=f"Idea for {lead.business.business_name}",content=content,status="DRAFT")
+    service_summary = service.services if service else ""
+    instruction = " ".join(filter(None,[service.company_name if service else "",service.description if service else "",service.services if service else "",service.offer if service else "",service.cta if service else "",service.preferred_tone if service else "",service.additional_instructions if service else "",profile.offer if profile else "",profile.cta if profile else "",profile.additional_instructions if profile else ""]))
+    composer = MessageComposerEngine()
+    draft = composer.compose(
+        profile=profile,
+        business_name=lead.business.business_name,
+        offer=profile.offer if profile else service.offer if service else "",
+        service_summary=service_summary,
+        cta=profile.cta if profile else service.cta if service else "Book a quick strategy call",
+        evidence=evidence,
+        tone=profile.tone if profile else service.preferred_tone if service else "Professional",
+        niche=profile.niche if profile else "",
+    )
+    content = draft.body
+    message=Message(lead_id=lead.id,instruction_profile_id=profile.id if profile else None,channel=data.channel,recipient=data.recipient,subject=draft.subject,content=content,status="DRAFT")
     db.add(message);db.commit();db.refresh(message);return message
 @app.post("/api/v1/messages/{message_id}/approve")
 def approve_message(message_id:int,db:Session=Depends(get_db)):
