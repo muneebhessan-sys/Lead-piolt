@@ -39,6 +39,7 @@ class PaymentIn(BaseModel): amount:int=Field(ge=0); currency:str="USD"; provider
 class CampaignIn(BaseModel): name:str=Field(min_length=1,max_length=200); channel:str="EMAIL"; sender_account:str=Field(default="",max_length=320); instruction_profile_id:int|None=None; lead_ids:list[int]=[]
 class IntegrationConfigIn(BaseModel): account_name:str=""; secret_value:str=""; enabled:bool=True
 class AdminSettingIn(BaseModel): key: str = Field(min_length=1, max_length=120); value: str = ""; protected: bool = False
+class CallStartIn(BaseModel): caller_id:str=""; agent_name:str|None=None
 class EmailSendIn(BaseModel): recipient:str=Field(min_length=3,max_length=320); subject:str=Field(min_length=1,max_length=300); content:str=Field(min_length=1)
 class SocialProfileIn(BaseModel): platform:str=Field(min_length=2,max_length=30); profile_url:str=Field(min_length=8,max_length=2000); username:str|None=None; source:str="USER_STORED"
 
@@ -347,6 +348,40 @@ def dashboard_metrics(db:Session=Depends(get_db)):
 def list_customers(db:Session=Depends(get_db)):
     return [{"id":item.id,"lead_id":item.lead_id,"business":db.get(Business,item.business_id).business_name,"status":item.status,"notes":item.notes} for item in db.query(Customer).order_by(Customer.id.desc()).all()]
 
+
+@app.get("/api/v1/calls")
+def list_calls(db:Session=Depends(get_db)):
+    return db.query(Call).order_by(Call.id.desc()).limit(100).all()
+
+
+@app.post("/api/v1/leads/{lead_id}/call", status_code=201)
+async def start_call(lead_id:int, data:CallStartIn, db:Session=Depends(get_db)):
+    lead = db.get(Lead, lead_id)
+    if not lead:
+        raise HTTPException(404, detail="Lead not found")
+    config = db.query(VoiceAgentConfig).first()
+    provider = LocalVoiceAgentProvider(config)
+    if provider.status == "NOT_CONFIGURED":
+        raise HTTPException(503, detail="VOICE_AGENT_NOT_CONFIGURED")
+    item = Call(lead_id=lead_id, customer_id=None, status="QUEUED", provider_reference=data.agent_name or config.name or "local_voice_agent", result="{}", error="")
+    db.add(item); db.flush()
+    try:
+        payload = await provider.start_call(lead_id, data.caller_id or "")
+        item.status = "CONNECTED"
+        item.result = json.dumps(payload)
+        item.provider_reference = payload.get("provider_reference", item.provider_reference)
+        lead.lifecycle = "CALLED"
+        db.add(TimelineEvent(lead_id=lead.id, event_type="CALL_STARTED", detail=f"Caller: {data.caller_id or 'local'}"))
+        db.commit(); db.refresh(item)
+        return item
+    except (httpx.HTTPError, ValueError) as exc:
+        item.status = "FAILED"
+        item.error = str(exc)
+        db.add(TimelineEvent(lead_id=lead.id, event_type="CALL_FAILED", detail=str(exc)))
+        db.commit(); db.refresh(item)
+        raise HTTPException(503, detail="VOICE_AGENT_OFFLINE") from exc
+
+
 @app.post("/api/v1/leads/{lead_id}/customer",status_code=201)
 def convert_customer(lead_id:int,data:CustomerIn,db:Session=Depends(get_db)):
     lead=db.get(Lead,lead_id)
@@ -386,6 +421,16 @@ def add_payment(customer_id:int,data:PaymentIn,db:Session=Depends(get_db)):
 @app.get("/api/v1/campaigns")
 def list_campaigns(db:Session=Depends(get_db)): return db.query(Campaign).order_by(Campaign.id.desc()).all()
 
+
+@app.get("/api/v1/campaigns/{campaign_id}/items")
+def campaign_items(campaign_id:int, db:Session=Depends(get_db)):
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, detail="Campaign not found")
+    items = db.query(CampaignItem).filter_by(campaign_id=campaign_id).order_by(CampaignItem.id.desc()).all()
+    return [{"id": item.id, "lead_id": item.lead_id, "message_id": item.message_id, "status": item.status} for item in items]
+
+
 @app.post("/api/v1/campaigns",status_code=201)
 def create_campaign(data:CampaignIn,db:Session=Depends(get_db)):
     if not data.sender_account: raise HTTPException(422,detail="Select a connected user sender account")
@@ -393,6 +438,18 @@ def create_campaign(data:CampaignIn,db:Session=Depends(get_db)):
     for lead_id in data.lead_ids:
         if db.get(Lead,lead_id): db.add(CampaignItem(campaign_id=campaign.id,lead_id=lead_id))
     db.commit(); db.refresh(campaign); return campaign
+
+
+@app.post("/api/v1/campaigns/{campaign_id}/launch")
+def launch_campaign(campaign_id:int, db:Session=Depends(get_db)):
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, detail="Campaign not found")
+    campaign.status = "QUEUED"
+    db.add(campaign)
+    db.commit()
+    return {"id": campaign.id, "status": campaign.status, "items": db.query(CampaignItem).filter_by(campaign_id=campaign_id).count()}
+
 
 @app.patch("/api/v1/campaigns/{campaign_id}")
 def update_campaign(campaign_id:int,data:StatusIn,db:Session=Depends(get_db)):
