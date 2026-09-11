@@ -99,6 +99,22 @@ def save_voice(data:VoiceIn,db:Session=Depends(get_db)):
     config=db.query(VoiceAgentConfig).first() or VoiceAgentConfig()
     for key,value in data.model_dump().items():setattr(config,key,value)
     db.add(config);db.commit();db.refresh(config);return get_voice(db)
+
+
+@app.post("/api/v1/admin/voice-agent/disconnect")
+def disconnect_voice(db:Session=Depends(get_db)):
+    config = db.query(VoiceAgentConfig).first()
+    if not config:
+        return {"status": "NOT_CONFIGURED"}
+    config.enabled = False
+    config.base_url = ""
+    config.health_path = "/health"
+    config.call_path = "/calls"
+    db.add(config)
+    db.commit()
+    return {"status": "DISCONNECTED"}
+
+
 @app.post("/api/v1/admin/voice-agent/test")
 async def test_voice(db:Session=Depends(get_db)):
     config = db.query(VoiceAgentConfig).first()
@@ -135,6 +151,25 @@ def list_admin_settings(db:Session=Depends(get_db)):
     return payload
 
 
+@app.get("/api/v1/admin/overview")
+def admin_overview(db:Session=Depends(get_db)):
+    return {
+        "leads": db.query(Lead).count(),
+        "customers": db.query(Customer).count(),
+        "projects": db.query(Project).count(),
+        "campaigns": db.query(Campaign).count(),
+        "jobs": db.query(Job).count(),
+        "integrations_configured": db.query(Integration).filter(Integration.status == "CONNECTED").count(),
+        "active_instruction_profiles": db.query(InstructionProfile).filter(InstructionProfile.active.is_(True)).count(),
+        "voice_status": LocalVoiceAgentProvider(db.query(VoiceAgentConfig).first()).status,
+    }
+
+
+@app.get("/api/v1/readyz")
+def readyz(db:Session=Depends(get_db)):
+    return {"status": "READY", "database": "OK", "jobs": db.query(Job).count()}
+
+
 @app.put("/api/v1/admin/settings/{key}")
 def upsert_admin_setting(key: str, data: AdminSettingIn, db: Session = Depends(get_db)):
     item = db.query(AdminSetting).filter_by(key=key).first() or AdminSetting(key=key)
@@ -154,6 +189,35 @@ def upsert_admin_setting(key: str, data: AdminSettingIn, db: Session = Depends(g
 def list_integrations(db:Session=Depends(get_db)):
     providers=["GOOGLE_PLACES","GMAIL","WHATSAPP","INSTAGRAM","FACEBOOK","LINKEDIN","X","TIKTOK","VOICE_AGENT","PAYMENTS"]
     return [safe_integration(db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider),provider) for provider in providers]
+
+
+@app.get("/api/v1/admin/accounts")
+def list_accounts(db:Session=Depends(get_db)):
+    providers=["GOOGLE_PLACES","GMAIL","WHATSAPP","INSTAGRAM","FACEBOOK","LINKEDIN","X","TIKTOK","VOICE_AGENT","PAYMENTS"]
+    return [{
+        "provider": provider,
+        "status": (db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider)).status or "NOT_CONFIGURED",
+        "account_name": (db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider)).account_name or "",
+        "capabilities": json.loads((db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider)).capabilities or "[]"),
+        "connected_at": (db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider)).last_test_at,
+        "last_error": (db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider)).last_error or "",
+    } for provider in providers]
+
+
+@app.post("/api/v1/admin/accounts/{provider}/default")
+def set_default_account(provider:str, db:Session=Depends(get_db)):
+    provider_name = provider.upper().replace("-","_")
+    item = db.query(Integration).filter_by(provider=provider_name).first()
+    if not item:
+        raise HTTPException(404, detail="Account not configured")
+    key = f"default_account_{provider_name}"
+    setting = db.query(AdminSetting).filter_by(key=key).first() or AdminSetting(key=key)
+    setting.value = str(item.id)
+    setting.protected = False
+    db.add(setting)
+    db.commit()
+    return {"provider": provider_name, "default_account_id": item.id, "status": item.status}
+
 
 @app.get("/api/v1/admin/integrations/{provider}")
 def get_integration(provider:str,db:Session=Depends(get_db)):
