@@ -1,0 +1,12 @@
+{
+  "name": "LeadPilot",
+  "short_name": "LeadPilot",
+  "description": "Local-first lead intelligence workspace",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080b17",
+  "theme_color": "#080b17",
+  "icons": [
+    { "src": "/leadpilot.svg", "sizes": "192x192 512x512", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
