@@ -50,11 +50,15 @@ class GooglePlacesProvider:
     def __init__(self, api_key: str | None = None): self.api_key = api_key if api_key is not None else settings.google_places_api_key
     def configured(self) -> bool: return bool(self.api_key)
     async def search(self, text_query: str, limit: int) -> list[dict]:
+        if not isinstance(text_query, str) or not text_query.strip():
+            raise GooglePlacesError("GOOGLE_QUERY_REQUIRED")
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero")
         if not self.configured(): raise GooglePlacesError("GOOGLE_PLACES_NOT_CONFIGURED")
         results=[]; token=None
         async with httpx.AsyncClient(timeout=settings.request_timeout) as client:
             while len(results)<limit:
-                data={"textQuery":text_query,"pageSize":min(20,limit-len(results))}
+                data={"textQuery":text_query.strip(),"pageSize":min(20,limit-len(results))}
                 if token:data["pageToken"]=token
                 response=await client.post(self.endpoint,json=data,headers={"X-Goog-Api-Key":self.api_key,"X-Goog-FieldMask":FIELD_MASK,"Content-Type":"application/json"})
                 if response.status_code in {401,403}: raise GooglePlacesError("GOOGLE_AUTH_FAILED")

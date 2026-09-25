@@ -3,7 +3,19 @@ from sqlalchemy.orm import sessionmaker
 from app.config import settings
 
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-engine = create_engine(settings.database_url, connect_args=connect_args, future=True)
+engine_kwargs = {
+    "future": True,
+    "echo": settings.database_echo,
+    "pool_pre_ping": True,
+}
+if connect_args:
+    engine_kwargs["connect_args"] = connect_args
+if not settings.database_url.startswith("sqlite"):
+    engine_kwargs["pool_size"] = settings.database_pool_size
+    engine_kwargs["max_overflow"] = settings.database_max_overflow
+    engine_kwargs["pool_timeout"] = settings.database_pool_timeout
+
+engine = create_engine(settings.database_url, **engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 def get_db():

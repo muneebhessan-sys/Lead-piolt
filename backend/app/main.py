@@ -1,25 +1,42 @@
-import base64, json, uuid
-from datetime import datetime, timezone
+import base64, hashlib, hmac, json, re, secrets, uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+import jwt
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import SessionLocal, get_db
-from app.models import AdminSetting, AuditLog, Business, BusinessSocialProfile, Call, Campaign, CampaignItem, Customer, InstructionProfile, Integration, Job, Lead, Message, Note, Payment, Project, ServiceProfile, TimelineEvent, VoiceAgentConfig, WebsiteAudit
+from app.models import (
+    Account, AdminSetting, AuditLog, Business, BusinessSocialProfile, Call, Campaign, CampaignItem,
+    CallStatus, Customer, InstructionProfile, InstructionVersion, Integration, Job, Lead, Message, MessageTemplate,
+    Note, OAuthState, OutboundMessage, OutboundMessageStatus, Payment, Project, ServiceProfile,
+    SystemSetting, TimelineEvent, VoiceAgentConfig, VoiceAgent, WebsiteAudit
+)
 from app.services.audit import audit_website
 from app.services.intelligence import IntelligenceEngine
 from app.services.jobs import LocalJobEngine
 from app.services.google_places import GooglePlacesError, GooglePlacesProvider, normalize_place
 from app.services.message_composer import MessageComposerEngine
+from app.services.message_engine.factory import MessageEngineFactory
+from app.services.messaging import MessageProviderFactory, OutboundMessageService
+from app.services.oauth import OAuthService, StateManager, ProviderRegistry, SafeProfileFetcher
 from app.services.security import secret_store
 from app.services.voice import LocalVoiceAgentProvider
+from app.services.voice.brain.rule_brain import RuleBrain
+from app.api.v1.webhooks import router as webhook_router
+from workers.dispatcher import CampaignDispatcher
 
 app = FastAPI(title="LeadPilot API", version="0.2.0")
+app.include_router(webhook_router)
 app.add_middleware(CORSMiddleware, allow_origins=[settings.frontend_origin], allow_methods=["*"], allow_headers=["*"])
 
 @app.exception_handler(HTTPException)
@@ -43,6 +60,30 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 
 jobs = LocalJobEngine()
+oauth_service = OAuthService()
+profile_fetcher = SafeProfileFetcher()
+campaign_dispatcher = CampaignDispatcher()
+message_engine_factory = MessageEngineFactory()
+voice_brains: dict[str, RuleBrain] = {}
+
+
+def create_admin_token(username: str, role: str = "admin") -> str:
+    payload = {"sub": username, "role": role, "exp": datetime.now(timezone.utc) + timedelta(hours=12)}
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def require_admin(authorization: str | None = Header(default=None)) -> dict:
+    if not settings.admin_auth_enabled:
+        return {"username": settings.admin_username, "role": "admin"}
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="INVALID_TOKEN") from exc
+    return {"username": payload.get("sub", settings.admin_username), "role": payload.get("role", "admin")}
+
 
 class InstructionIn(BaseModel):
     name: str = Field(min_length=1, max_length=160); niche: str=""; language: str="English"; tone: str="Professional"; offer: str=""; services: str=""; cta: str=""; rules: str=""; do_not_say: str=""; personalization_rules: str=""; additional_instructions: str=""; active: bool=True
@@ -55,17 +96,128 @@ class DiscoveryIn(BaseModel):
 class ServiceIn(BaseModel):
     company_name:str=""; description:str=""; services:str=""; target_niches:str=""; target_locations:str=""; offer:str=""; portfolio_url:str=""; contact_information:str=""; cta:str=""; preferred_tone:str="Professional"; additional_instructions:str=""
 class DraftIn(BaseModel): instruction_profile_id:int|None=None; recipient:str=""; channel:str="EMAIL"
+class MessageSendIn(BaseModel):
+    recipient: str = Field(min_length=1, max_length=320)
+    channel: str = Field(default="EMAIL", min_length=2, max_length=30)
+    subject: str = ""
+    body: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1, max_length=255)
+    lead_id: int | None = None
+    campaign_id: int | None = None
 class StatusIn(BaseModel): status: str = Field(min_length=1, max_length=30)
 class CustomerIn(BaseModel): notes: str = ""
 class ProjectIn(BaseModel): name:str=Field(min_length=1,max_length=200); description:str=""; status:str="PLANNED"; start_date:str|None=None; due_date:str|None=None; amount:int=Field(default=0,ge=0); notes:str=""
 class NoteIn(BaseModel): content:str=Field(min_length=1)
 class PaymentIn(BaseModel): amount:int=Field(ge=0); currency:str="USD"; provider:str=""; status:str="PENDING"; reference:str=""
 class CampaignIn(BaseModel): name:str=Field(min_length=1,max_length=200); channel:str="EMAIL"; sender_account:str=Field(default="",max_length=320); instruction_profile_id:int|None=None; lead_ids:list[int]=[]
+class OutreachProfileIn(BaseModel):
+    portfolio_urls: list[str] = []
+    reference_websites: list[str] = []
+    sender_name: str = ""
+    default_cta: str = "Would you like a quick, no-pressure review?"
+class CampaignPrepareIn(BaseModel): lead_ids: list[int] = []
+class CampaignSendIn(BaseModel): lead_ids: list[int] = Field(min_length=1); channel: str | None = None
 class IntegrationConfigIn(BaseModel): account_name:str=""; secret_value:str=""; enabled:bool=True
 class AdminSettingIn(BaseModel): key: str = Field(min_length=1, max_length=120); value: str = ""; protected: bool = False
-class CallStartIn(BaseModel): caller_id:str=""; agent_name:str|None=None
+class ThemeIn(BaseModel): theme: str = "OBSIDIAN"; reduced_motion: bool = False
+class CallStartIn(BaseModel):
+    caller_id: str = ""
+    to_number: str = ""
+    agent_name: str | None = None
 class EmailSendIn(BaseModel): recipient:str=Field(min_length=3,max_length=320); subject:str=Field(min_length=1,max_length=300); content:str=Field(min_length=1)
 class SocialProfileIn(BaseModel): platform:str=Field(min_length=2,max_length=30); profile_url:str=Field(min_length=8,max_length=2000); username:str|None=None; source:str="USER_STORED"
+
+# OAuth models
+class OAuthBeginIn(BaseModel):
+    provider: str = Field(min_length=1, max_length=50)
+    redirect_uri: str = Field(min_length=1, max_length=500)
+    extra_scopes: list[str] | None = None
+    extra_params: dict[str, str] | None = None
+
+class OAuthCallbackIn(BaseModel):
+    code: str = Field(min_length=1)
+    state: str = Field(min_length=1)
+
+class AccountConfigureIn(BaseModel):
+    account_name: str = ""
+    access_token: str = ""
+    refresh_token: str = ""
+    provider_user_id: str = ""
+    token_expires_in: int | None = None
+    settings: dict[str, Any] | None = None
+
+class AccountTestIn(BaseModel):
+    provider: str = Field(min_length=1, max_length=50)
+
+# Voice models
+class VoiceAgentIn(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    provider: str = "local"
+    base_url: str = ""
+    api_key: str = ""
+    config: dict[str, Any] = {}
+    enabled: bool = False
+
+class VoiceCallIn(BaseModel):
+    lead_id: int | None = None
+    customer_id: int | None = None
+    from_number: str = ""
+    to_number: str = ""
+
+class VoiceAgentTurnIn(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+    conversation_id: str = "default"
+
+class PhoneVerificationIn(BaseModel):
+    code: str = Field(min_length=4, max_length=8)
+
+# Message Template models
+class MessageTemplateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    template_type: str = Field(pattern="^(EMAIL|SMS|VOICE|WHATSAPP)$")
+    subject: str = ""
+    content: str = Field(min_length=1)
+    variables: list[str] = []
+    description: str = ""
+    is_system: bool = False
+
+class MessageTemplateTestIn(BaseModel):
+    template_id: int
+    variables: dict[str, str] = {}
+
+# Instruction Version models
+class InstructionVersionCaptureIn(BaseModel):
+    instruction_profile_id: int
+    name: str = Field(min_length=1, max_length=160)
+    niche: str = ""
+    language: str = "English"
+    tone: str = "Professional"
+    offer: str = ""
+    services: str = ""
+    cta: str = ""
+    rules: str = ""
+    do_not_say: str = ""
+    personalization_rules: str = ""
+    additional_instructions: str = ""
+
+# Campaign models
+class CampaignLaunchIn(BaseModel):
+    lead_ids: list[int] = []
+    message_template_id: int | None = None
+    instruction_version_id: int | None = None
+
+class CampaignControlIn(BaseModel):
+    action: str = Field(pattern="^(pause|resume|stop)$")
+
+
+# System Setting models
+class SystemSettingIn(BaseModel):
+    key: str = Field(min_length=1, max_length=120)
+    value: str = ""
+    value_type: str = Field(default="string", pattern="^(string|int|bool|json)$")
+    description: str = ""
+    is_secret: bool = False
+    category: str = "general"
 
 @app.middleware("http")
 async def request_id(request:Request, call_next):
@@ -75,7 +227,29 @@ async def request_id(request:Request, call_next):
     except Exception:
         result="ERROR";safe_error="Unhandled request error";raise
     finally:
-        db=SessionLocal();db.add(AuditLog(action=f"{request.method} {request.url.path}",subsystem="API",result=locals().get("result","ERROR"),request_id=request_id,safe_error=locals().get("safe_error","")));db.commit();db.close()
+        db = None
+        try:
+            db=SessionLocal()
+            db.add(AuditLog(
+                action=f"{request.method} {request.url.path}",
+                subsystem="API",
+                result=locals().get("result","ERROR"),
+                request_id=request_id,
+                safe_error=locals().get("safe_error",""),
+            ))
+            db.commit()
+        except Exception:
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
     response.headers["X-Request-ID"]=request_id; return response
 @app.get("/healthz")
 def healthz(): return {"status":"OK","service":"leadpilot","database":"SQLITE"}
@@ -93,19 +267,19 @@ async def audit(payload:dict):
     except ValueError as exc:raise HTTPException(422,detail=str(exc)) from exc
     except Exception as exc:raise HTTPException(502,detail="WEBSITE_UNREACHABLE") from exc
 @app.get("/api/v1/admin/instructions")
-def list_instructions(db:Session=Depends(get_db)): return db.query(InstructionProfile).order_by(InstructionProfile.id.desc()).all()
+def list_instructions(db:Session=Depends(get_db), admin: dict = Depends(require_admin)): return db.query(InstructionProfile).order_by(InstructionProfile.id.desc()).all()
 @app.post("/api/v1/admin/instructions",status_code=201)
-def create_instruction(data:InstructionIn,db:Session=Depends(get_db)):
+def create_instruction(data:InstructionIn,db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     if db.query(InstructionProfile).filter_by(name=data.name).first():raise HTTPException(409,detail="Profile name already exists")
     item=InstructionProfile(**data.model_dump());db.add(item);db.commit();db.refresh(item);return item
 @app.put("/api/v1/admin/instructions/{profile_id}")
-def update_instruction(profile_id:int,data:InstructionIn,db:Session=Depends(get_db)):
+def update_instruction(profile_id:int,data:InstructionIn,db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     item=db.get(InstructionProfile,profile_id)
     if not item:raise HTTPException(404,detail="Instruction profile not found")
     for key,value in data.model_dump().items():setattr(item,key,value)
     db.commit();db.refresh(item);return item
 @app.delete("/api/v1/admin/instructions/{profile_id}",status_code=204)
-def delete_instruction(profile_id:int,db:Session=Depends(get_db)):
+def delete_instruction(profile_id:int,db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     item=db.get(InstructionProfile,profile_id)
     if not item:raise HTTPException(404,detail="Instruction profile not found")
     db.delete(item);db.commit()
@@ -121,20 +295,20 @@ def job_action(job_id:int,action:str,db:Session=Depends(get_db)):
     try:return jobs.transition(db,job,action)
     except ValueError as exc:raise HTTPException(409,detail=str(exc)) from exc
 @app.get("/api/v1/admin/voice-agent")
-def get_voice(db:Session=Depends(get_db)):
+def get_voice(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     config=db.query(VoiceAgentConfig).first()
     if not config:
         return {"status":"NOT_CONFIGURED","name":"Local voice agent","base_url":"","health_path":"/health","call_path":"/calls","enabled":False}
     return {"id": config.id, "name": config.name, "base_url": config.base_url, "health_path": config.health_path, "call_path": config.call_path, "enabled": config.enabled, "status": LocalVoiceAgentProvider(config).status}
 @app.put("/api/v1/admin/voice-agent")
-def save_voice(data:VoiceIn,db:Session=Depends(get_db)):
+def save_voice(data:VoiceIn,db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     config=db.query(VoiceAgentConfig).first() or VoiceAgentConfig()
     for key,value in data.model_dump().items():setattr(config,key,value)
     db.add(config);db.commit();db.refresh(config);return get_voice(db)
 
 
 @app.post("/api/v1/admin/voice-agent/disconnect")
-def disconnect_voice(db:Session=Depends(get_db)):
+def disconnect_voice(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     config = db.query(VoiceAgentConfig).first()
     if not config:
         return {"status": "NOT_CONFIGURED"}
@@ -148,7 +322,7 @@ def disconnect_voice(db:Session=Depends(get_db)):
 
 
 @app.post("/api/v1/admin/voice-agent/test")
-async def test_voice(db:Session=Depends(get_db)):
+async def test_voice(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     config = db.query(VoiceAgentConfig).first()
     provider = LocalVoiceAgentProvider(config)
     if provider.status == "NOT_CONFIGURED":
@@ -161,10 +335,236 @@ async def test_voice(db:Session=Depends(get_db)):
 @app.post("/api/v1/intelligence/score")
 def score(payload:dict):return IntelligenceEngine().score(payload.get("website_status"),bool(payload.get("phone")),bool(payload.get("website"))).__dict__
 @app.get("/api/v1/admin/logs")
-def list_logs(db:Session=Depends(get_db)):return db.query(AuditLog).order_by(AuditLog.id.desc()).limit(100).all()
+def list_logs(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):return db.query(AuditLog).order_by(AuditLog.id.desc()).limit(100).all()
+
+def normalize_provider_name(provider: str) -> str:
+    return str(provider or "").strip().upper().replace("-", "_")
+
 
 def safe_integration(item:Integration, provider:str):
     return {"provider":provider,"status":item.status or "NOT_CONFIGURED","account_name":item.account_name or "","capabilities":json.loads(item.capabilities or "[]"),"enabled":bool(item.enabled),"last_error":item.last_error or "","last_verified":item.last_test_at,"configured":bool(item.secret_value)}
+
+
+def integration_status(db: Session, provider: str) -> dict:
+    item = db.query(Integration).filter_by(provider=provider).first()
+    account_provider = "META" if provider in {"INSTAGRAM", "FACEBOOK"} else provider
+    account = db.query(Account).filter_by(provider=account_provider).order_by(Account.id.desc()).first()
+    result = safe_integration(item or Integration(provider=provider), provider)
+    if account and account.status == "ACTIVE" and account.access_token_encrypted:
+        capabilities = {
+            "GMAIL": ["gmail", "email", "oauth_profile"],
+            "META": ["instagram", "facebook", "oauth_profile"],
+            "LINKEDIN": ["linkedin", "oauth_profile"],
+            "TIKTOK": ["tiktok", "oauth_profile"],
+        }.get(account_provider, ["oauth_profile"])
+        result.update({
+            "status": "CONNECTED",
+            "account_name": account.name or account.email,
+            "configured": True,
+            "enabled": True,
+            "capabilities": result["capabilities"] or capabilities,
+            "last_error": "",
+        })
+    return result
+
+
+def _contact_profile_settings(db: Session) -> dict[str, str]:
+    settings = {}
+    for key in [
+        "contact.voice_phone",
+        "contact.voice_phone_verified",
+        "contact.whatsapp_phone",
+        "contact.whatsapp_phone_verified",
+        "contact.instagram_handle",
+        "contact.facebook_handle",
+        "contact.linkedin_url",
+        "contact.threads_url",
+        "contact.tiktok_handle",
+        "contact.gmail_email",
+        "contact.email_sender_name",
+    ]:
+        item = db.query(AdminSetting).filter_by(key=key).first()
+        settings[key] = item.value if item else ""
+    return settings
+
+
+def _save_call_transcript(call_id: int, lead_id: int | None, caller_id: str, to_number: str, transcript: str, response_text: str) -> tuple[str, str]:
+    transcript_dir = Path(__file__).resolve().parent.parent / "call_transcripts"
+    transcript_dir.mkdir(exist_ok=True)
+    safe_name = f"call_{call_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    text_path = transcript_dir / f"{safe_name}.txt"
+    pdf_path = transcript_dir / f"{safe_name}.pdf"
+
+    text_payload = "\n".join([
+        "LeadPilot Voice Call Transcript",
+        f"Call ID: {call_id}",
+        f"Lead ID: {lead_id or 'N/A'}",
+        f"Caller: {caller_id or 'N/A'}",
+        f"Destination: {to_number or 'N/A'}",
+        "",
+        "Agent:",
+        response_text,
+        "",
+        "Transcript:",
+        transcript or "No transcript captured.",
+    ])
+    text_path.write_text(text_payload, encoding="utf-8")
+
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas
+
+        pdf = canvas.Canvas(str(pdf_path), pagesize=letter)
+        pdf.setTitle(f"LeadPilot call transcript {call_id}")
+        pdf.setFont("Helvetica", 12)
+        lines = text_payload.splitlines()
+        y = 760
+        for line in lines:
+            if y < 40:
+                pdf.showPage()
+                y = 760
+            pdf.drawString(50, y, line[:110])
+            y -= 18
+        pdf.save()
+    except Exception:
+        pdf_path = text_path
+
+    return str(text_path), str(pdf_path)
+
+
+@app.get("/api/v1/admin/contact-profile")
+def get_contact_profile(db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    profile = _contact_profile_settings(db)
+    voice_phone = profile.get("contact.voice_phone", "")
+    whatsapp_phone = profile.get("contact.whatsapp_phone", "")
+    voice_verified = profile.get("contact.voice_phone_verified", "false") == "true"
+    whatsapp_verified = profile.get("contact.whatsapp_phone_verified", "false") == "true"
+    return {
+        "phone_number": voice_phone or whatsapp_phone,
+        "voice_phone": voice_phone,
+        "voice_phone_status": "VERIFIED" if voice_verified else ("PENDING_PROVIDER_VERIFICATION" if voice_phone else "NOT_CONFIGURED"),
+        "whatsapp_phone": whatsapp_phone,
+        "whatsapp_phone_status": "VERIFIED" if whatsapp_verified else ("PENDING_PROVIDER_VERIFICATION" if whatsapp_phone else "NOT_CONFIGURED"),
+        "instagram_handle": profile.get("contact.instagram_handle", ""),
+        "facebook_handle": profile.get("contact.facebook_handle", ""),
+        "linkedin_url": profile.get("contact.linkedin_url", ""),
+        "threads_url": profile.get("contact.threads_url", ""),
+        "tiktok_handle": profile.get("contact.tiktok_handle", ""),
+        "gmail_email": profile.get("contact.gmail_email", ""),
+        "email_sender_name": profile.get("contact.email_sender_name", ""),
+    }
+
+
+@app.put("/api/v1/admin/contact-profile")
+def save_contact_profile(data: dict, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    shared_phone = str(data.get("phone_number", "") or "").strip()
+    if shared_phone:
+        data = {**data, "voice_phone": shared_phone, "whatsapp_phone": shared_phone}
+    allowed = {
+        "voice_phone": "contact.voice_phone",
+        "whatsapp_phone": "contact.whatsapp_phone",
+        "instagram_handle": "contact.instagram_handle",
+        "facebook_handle": "contact.facebook_handle",
+        "linkedin_url": "contact.linkedin_url",
+        "threads_url": "contact.threads_url",
+        "tiktok_handle": "contact.tiktok_handle",
+        "gmail_email": "contact.gmail_email",
+        "email_sender_name": "contact.email_sender_name",
+    }
+
+    for key, db_key in allowed.items():
+        value = data.get(key, "")
+        item = db.query(AdminSetting).filter_by(key=db_key).first() or AdminSetting(key=db_key)
+        item.value = str(value or "").strip()
+        db.add(item)
+    for phone_key in ("voice_phone", "whatsapp_phone"):
+        phone = str(data.get(phone_key, "") or "").strip()
+        verified_key = f"contact.{phone_key}_verified"
+        verified = db.query(AdminSetting).filter_by(key=verified_key).first() or AdminSetting(key=verified_key)
+        if not phone or not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
+            verified.value = "false"
+        db.add(verified)
+    db.commit()
+    return get_contact_profile(db, admin)
+
+
+def _outreach_profile(db: Session) -> dict[str, Any]:
+    def read(key: str, default: Any):
+        item = db.query(AdminSetting).filter_by(key=f"outreach.{key}").first()
+        if not item or not item.value:
+            return default
+        try:
+            return json.loads(item.value)
+        except json.JSONDecodeError:
+            return item.value
+
+    return {
+        "portfolio_urls": read("portfolio_urls", []),
+        "reference_websites": read("reference_websites", []),
+        "sender_name": read("sender_name", ""),
+        "default_cta": read("default_cta", "Would you like a quick, no-pressure review?"),
+    }
+
+
+@app.get("/api/v1/admin/outreach-profile")
+def get_outreach_profile(db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    return _outreach_profile(db)
+
+
+@app.put("/api/v1/admin/outreach-profile")
+def save_outreach_profile(data: OutreachProfileIn, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    values = data.model_dump()
+    for key, value in values.items():
+        item = db.query(AdminSetting).filter_by(key=f"outreach.{key}").first() or AdminSetting(key=f"outreach.{key}")
+        item.value = json.dumps(value)
+        item.protected = False
+        db.add(item)
+    db.commit()
+    return _outreach_profile(db)
+
+
+@app.post("/api/v1/admin/contact-profile/{phone_key}/verification-request")
+def request_phone_verification(phone_key: str, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    if phone_key not in {"voice_phone", "whatsapp_phone"}:
+        raise HTTPException(404, detail="PHONE_PROFILE_NOT_FOUND")
+    profile = _contact_profile_settings(db)
+    phone = profile.get(f"contact.{phone_key}", "")
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
+        raise HTTPException(422, detail="PHONE_MUST_USE_E164_FORMAT")
+    code = f"{secrets.randbelow(1000000):06d}"
+    challenge_key = f"verification_code:{phone_key}"
+    challenge = db.query(AdminSetting).filter_by(key=challenge_key).first() or AdminSetting(key=challenge_key, protected=True)
+    challenge.value = secret_store.encrypt(json.dumps({"phone": phone, "code": code, "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()}))
+    challenge.protected = True
+    db.add(challenge)
+    db.commit()
+    response = {"phone": phone, "status": "PENDING_PROVIDER_VERIFICATION", "message": "Verification code generated. Configure a production verification sender before exposing this flow."}
+    if settings.development_mode:
+        response["development_code"] = code
+    return response
+
+
+@app.post("/api/v1/admin/contact-profile/{phone_key}/verification-confirm")
+def confirm_phone_verification(phone_key: str, data: PhoneVerificationIn, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    if phone_key not in {"voice_phone", "whatsapp_phone"}:
+        raise HTTPException(404, detail="PHONE_PROFILE_NOT_FOUND")
+    challenge = db.query(AdminSetting).filter_by(key=f"verification_code:{phone_key}").first()
+    if not challenge or not challenge.value:
+        raise HTTPException(409, detail="VERIFICATION_NOT_REQUESTED")
+    try:
+        payload = json.loads(secret_store.decrypt(challenge.value))
+        expires_at = datetime.fromisoformat(payload["expires_at"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(409, detail="VERIFICATION_INVALID") from exc
+    if expires_at <= datetime.now(timezone.utc) or not secrets.compare_digest(str(payload.get("code", "")), data.code):
+        raise HTTPException(422, detail="VERIFICATION_CODE_INVALID")
+    verified = db.query(AdminSetting).filter_by(key=f"contact.{phone_key}_verified").first() or AdminSetting(key=f"contact.{phone_key}_verified")
+    verified.value = "true"
+    db.add(verified)
+    challenge.value = ""
+    db.add(challenge)
+    db.commit()
+    return {"phone": payload["phone"], "status": "VERIFIED"}
 
 
 def google_provider(db:Session) -> GooglePlacesProvider:
@@ -173,8 +573,23 @@ def google_provider(db:Session) -> GooglePlacesProvider:
     return GooglePlacesProvider(secret) if secret else GooglePlacesProvider()
 
 
+@app.post("/api/v1/admin/login")
+def login_admin(data: dict, db: Session = Depends(get_db)):
+    username = str(data.get("username", "")).strip() or settings.admin_username
+    password = str(data.get("password", "")).strip() or settings.admin_password
+    if username != settings.admin_username or password != settings.admin_password:
+        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
+    token = create_admin_token(username)
+    return {"token": token, "role": "admin", "username": username, "expires_in_hours": 12}
+
+
+@app.get("/api/v1/admin/me")
+def admin_me(admin: dict = Depends(require_admin)):
+    return {"username": admin.get("username", settings.admin_username), "role": admin.get("role", "admin")}
+
+
 @app.get("/api/v1/admin/settings")
-def list_admin_settings(db:Session=Depends(get_db)):
+def list_admin_settings(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     settings_items = db.query(AdminSetting).order_by(AdminSetting.key.asc()).all()
     payload = []
     for item in settings_items:
@@ -183,8 +598,53 @@ def list_admin_settings(db:Session=Depends(get_db)):
     return payload
 
 
+def _read_admin_theme(db: Session):
+    try:
+        db.execute(text("SELECT 1 FROM admin_settings LIMIT 1"))
+    except Exception:
+        AdminSetting.__table__.create(bind=db.bind, checkfirst=True)
+
+    theme = db.query(AdminSetting).filter_by(key="ui.theme").first()
+    reduced_motion = db.query(AdminSetting).filter_by(key="ui.reduced_motion").first()
+    theme_name = (theme.value if theme and theme.value else "OBSIDIAN").upper()
+    if theme_name not in {"OBSIDIAN", "AURORA"}:
+        theme_name = "OBSIDIAN"
+    reduced = str((reduced_motion.value if reduced_motion and reduced_motion.value else "false")).strip().lower() == "true"
+    return {
+        "theme": theme_name,
+        "reduced_motion": reduced,
+        "available_themes": ["OBSIDIAN", "AURORA"],
+    }
+
+
+@app.get("/api/v1/admin/theme")
+def get_theme(db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    return _read_admin_theme(db)
+
+
+@app.put("/api/v1/admin/theme")
+def update_theme(data: ThemeIn, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    try:
+        db.execute(text("SELECT 1 FROM admin_settings LIMIT 1"))
+    except Exception:
+        AdminSetting.__table__.create(bind=db.bind, checkfirst=True)
+
+    theme_name = str(data.theme or "OBSIDIAN").upper().strip()
+    if theme_name not in {"OBSIDIAN", "AURORA"}:
+        raise HTTPException(status_code=422, detail="Theme must be OBSIDIAN or AURORA")
+
+    theme_item = db.query(AdminSetting).filter_by(key="ui.theme").first() or AdminSetting(key="ui.theme")
+    motion_item = db.query(AdminSetting).filter_by(key="ui.reduced_motion").first() or AdminSetting(key="ui.reduced_motion")
+    theme_item.value = theme_name
+    motion_item.value = "true" if bool(data.reduced_motion) else "false"
+    db.add(theme_item)
+    db.add(motion_item)
+    db.commit()
+    return _read_admin_theme(db)
+
+
 @app.get("/api/v1/admin/overview")
-def admin_overview(db:Session=Depends(get_db)):
+def admin_overview(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     return {
         "leads": db.query(Lead).count(),
         "customers": db.query(Customer).count(),
@@ -203,7 +663,7 @@ def readyz(db:Session=Depends(get_db)):
 
 
 @app.put("/api/v1/admin/settings/{key}")
-def upsert_admin_setting(key: str, data: AdminSettingIn, db: Session = Depends(get_db)):
+def upsert_admin_setting(key: str, data: AdminSettingIn, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
     item = db.query(AdminSetting).filter_by(key=key).first() or AdminSetting(key=key)
     item.protected = data.protected
     if data.protected:
@@ -218,27 +678,111 @@ def upsert_admin_setting(key: str, data: AdminSettingIn, db: Session = Depends(g
 
 
 @app.get("/api/v1/admin/integrations")
-def list_integrations(db:Session=Depends(get_db)):
+def list_integrations(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     providers=["GOOGLE_PLACES","GMAIL","WHATSAPP","INSTAGRAM","FACEBOOK","LINKEDIN","X","TIKTOK","VOICE_AGENT","PAYMENTS"]
-    return [safe_integration(db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider),provider) for provider in providers]
+    return [integration_status(db, provider) for provider in providers]
 
 
 @app.get("/api/v1/admin/accounts")
-def list_accounts(db:Session=Depends(get_db)):
+def list_accounts(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     providers=["GOOGLE_PLACES","GMAIL","WHATSAPP","INSTAGRAM","FACEBOOK","LINKEDIN","X","TIKTOK","VOICE_AGENT","PAYMENTS"]
     return [{
         "provider": provider,
-        "status": (db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider)).status or "NOT_CONFIGURED",
-        "account_name": (db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider)).account_name or "",
-        "capabilities": json.loads((db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider)).capabilities or "[]"),
-        "connected_at": (db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider)).last_test_at,
-        "last_error": (db.query(Integration).filter_by(provider=provider).first() or Integration(provider=provider)).last_error or "",
+        "status": ((db.query(Account).filter_by(provider=provider).order_by(Account.id.desc()).first()).status.value
+                   if db.query(Account).filter_by(provider=provider).first() else "NOT_CONFIGURED"),
+        "account_name": ((db.query(Account).filter_by(provider=provider).order_by(Account.id.desc()).first()).name
+                         if db.query(Account).filter_by(provider=provider).first() else ""),
+        "account_id": ((db.query(Account).filter_by(provider=provider).order_by(Account.id.desc()).first()).provider_user_id
+                       if db.query(Account).filter_by(provider=provider).first() else ""),
+        "capabilities": [],
+        "connected_at": ((db.query(Account).filter_by(provider=provider).order_by(Account.id.desc()).first()).last_login_at
+                         if db.query(Account).filter_by(provider=provider).first() else None),
+        "last_error": "",
     } for provider in providers]
 
 
+@app.put("/api/v1/admin/accounts/{provider}")
+def configure_account(provider: str, data: AccountConfigureIn, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    provider_name = normalize_provider_name(provider)
+    email = data.account_name.strip() or str(admin.get("username", settings.admin_username))
+    account = db.query(Account).filter_by(email=email, provider=provider_name).first()
+    if account is None:
+        account = Account(email=email, name=data.account_name.strip() or email, provider=provider_name)
+        db.add(account)
+    account.name = data.account_name.strip() or account.name
+    account.provider_user_id = data.provider_user_id.strip()
+    if data.access_token:
+        account.access_token_encrypted = secret_store.encrypt(data.access_token.strip())
+    if data.refresh_token:
+        account.refresh_token_encrypted = secret_store.encrypt(data.refresh_token.strip())
+    if data.settings is not None:
+        account.settings = json.dumps(data.settings)
+    if data.token_expires_in is not None:
+        account.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=data.token_expires_in)
+    account.status = "ACTIVE" if account.access_token_encrypted else "PENDING_VERIFICATION"
+    account.last_login_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(account)
+    return {"id": account.id, "provider": account.provider, "name": account.name, "status": account.status.value}
+
+
+@app.delete("/api/v1/admin/accounts/{provider}", status_code=204)
+def disconnect_account(provider: str, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    provider_name = normalize_provider_name(provider)
+    accounts = db.query(Account).filter_by(provider=provider_name).all()
+    for account in accounts:
+        account.access_token_encrypted = ""
+        account.refresh_token_encrypted = ""
+        account.status = "INACTIVE"
+    if accounts:
+        db.commit()
+
+
+@app.post("/api/v1/admin/oauth/begin")
+def begin_oauth(data: OAuthBeginIn, admin: dict = Depends(require_admin)):
+    try:
+        return oauth_service.begin_authorization(
+            data.provider,
+            data.redirect_uri,
+            extra_scopes=data.extra_scopes,
+            extra_params=data.extra_params,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/admin/oauth/callback")
+def complete_oauth(data: OAuthCallbackIn, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    stored = StateManager.validate(data.state)
+    if stored is None:
+        raise HTTPException(status_code=400, detail="INVALID_OR_EXPIRED_STATE")
+    provider = str(stored.get("provider", ""))
+    try:
+        tokens = oauth_service.exchange_code(provider, data.code, data.state, validated_state=stored)
+        user_id = str(admin.get("username", settings.admin_username))
+        profile = {}
+        try:
+            profile = profile_fetcher.fetch(provider, str(tokens.get("access_token", "")))
+        except (ValueError, httpx.HTTPError):
+            profile = {}
+        account_name = str(profile.get("name") or profile.get("displayName") or profile.get("email") or profile.get("username") or user_id)
+        provider_user_id = str(profile.get("id") or "")
+        oauth_service.store_tokens(user_id, provider, tokens, db=db, account_name=account_name, provider_user_id=provider_user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "provider": provider,
+        "status": "CONNECTED",
+        "account": account_name,
+        "provider_user_id": provider_user_id,
+        "profile": profile,
+        "token_expires_in": tokens.get("expires_in"),
+    }
+
+
 @app.post("/api/v1/admin/accounts/{provider}/default")
-def set_default_account(provider:str, db:Session=Depends(get_db)):
-    provider_name = provider.upper().replace("-","_")
+def set_default_account(provider:str, db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
+    provider_name = normalize_provider_name(provider)
     item = db.query(Integration).filter_by(provider=provider_name).first()
     if not item:
         raise HTTPException(404, detail="Account not configured")
@@ -252,26 +796,27 @@ def set_default_account(provider:str, db:Session=Depends(get_db)):
 
 
 @app.get("/api/v1/admin/integrations/{provider}")
-def get_integration(provider:str,db:Session=Depends(get_db)):
-    name=provider.upper().replace("-","_"); item=db.query(Integration).filter_by(provider=name).first() or Integration(provider=name)
-    return safe_integration(item,name)
+def get_integration(provider:str,db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
+    name=normalize_provider_name(provider)
+    return integration_status(db, name)
 
 @app.put("/api/v1/admin/integrations/{provider}")
-def configure_integration(provider:str,data:IntegrationConfigIn,db:Session=Depends(get_db)):
-    name=provider.upper().replace("-","_"); item=db.query(Integration).filter_by(provider=name).first() or Integration(provider=name)
-    item.account_name=data.account_name; item.enabled=data.enabled
-    if data.secret_value:
-        item.secret_value = secret_store.encrypt(data.secret_value)
-    item.status="CONFIGURED" if item.enabled and (data.secret_value or item.secret_value) else "NOT_CONFIGURED"; item.last_error=""
+def configure_integration(provider:str,data:IntegrationConfigIn,db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
+    name=normalize_provider_name(provider); item=db.query(Integration).filter_by(provider=name).first() or Integration(provider=name)
+    item.account_name = (data.account_name or "").strip(); item.enabled = bool(data.enabled)
+    if data.secret_value is not None:
+        cleaned = data.secret_value.strip()
+        item.secret_value = secret_store.encrypt(cleaned) if cleaned else ""
+    item.status = "CONFIGURED" if item.enabled and bool(item.secret_value) else "NOT_CONFIGURED"; item.last_error=""
     db.add(item); db.commit(); db.refresh(item); return safe_integration(item,name)
 
 @app.delete("/api/v1/admin/integrations/{provider}",status_code=204)
-def disconnect_integration(provider:str,db:Session=Depends(get_db)):
-    item=db.query(Integration).filter_by(provider=provider.upper()).first()
+def disconnect_integration(provider:str,db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
+    item=db.query(Integration).filter_by(provider=normalize_provider_name(provider)).first()
     if item: item.secret_value=""; item.account_name=""; item.enabled=False; item.status="NOT_CONFIGURED"; item.last_error=""; db.commit()
 
 @app.post("/api/v1/admin/integrations/gmail/test")
-async def test_gmail(db:Session=Depends(get_db)):
+async def test_gmail(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     item=db.query(Integration).filter_by(provider="GMAIL").first()
     if not item or not item.secret_value: raise HTTPException(503,detail="GMAIL_NOT_CONFIGURED")
     secret = secret_store.decrypt(item.secret_value)
@@ -296,26 +841,26 @@ async def send_email(data:EmailSendIn,db:Session=Depends(get_db)):
     except Exception as exc: raise HTTPException(502,detail="GMAIL_SEND_FAILED") from exc
 
 @app.post("/api/v1/admin/integrations/{provider}/test")
-async def test_social_provider(provider:str,db:Session=Depends(get_db)):
-    name=provider.upper().replace("-","_")
+async def test_social_provider(provider:str,db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
+    name=normalize_provider_name(provider)
     if name in {"GOOGLE_PLACES","GMAIL"}: raise HTTPException(404,detail="Use the provider-specific test route")
     item=db.query(Integration).filter_by(provider=name).first()
     if not item or not item.secret_value: raise HTTPException(503,detail=f"{name}_NOT_CONFIGURED")
     item.status="CAPABILITY_UNAVAILABLE"; item.last_error="Official provider verification requires OAuth onboarding and approved capabilities"; item.last_test_at=datetime.now(timezone.utc); db.commit()
     raise HTTPException(503,detail="CAPABILITY_UNAVAILABLE")
 @app.get("/api/v1/admin/integrations/google-places")
-def google_status(db:Session=Depends(get_db)):
+def google_status(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     item=db.query(Integration).filter_by(provider="GOOGLE_PLACES").first()
     if item and item.secret_value: return safe_integration(item,"GOOGLE_PLACES")
     return {"provider":"GOOGLE_PLACES","status":"CONFIGURED" if GooglePlacesProvider().configured() else "NOT_CONFIGURED","account_name":"","capabilities":[],"enabled":False,"last_error":"","last_verified":None,"configured":GooglePlacesProvider().configured()}
 
 @app.put("/api/v1/admin/integrations/google-places")
-def configure_google(data:IntegrationConfigIn,db:Session=Depends(get_db)): return configure_integration("GOOGLE_PLACES",data,db)
+def configure_google(data:IntegrationConfigIn,db:Session=Depends(get_db), admin: dict = Depends(require_admin)): return configure_integration("GOOGLE_PLACES",data,db,admin)
 
 @app.delete("/api/v1/admin/integrations/google-places",status_code=204)
-def remove_google(db:Session=Depends(get_db)): return disconnect_integration("GOOGLE_PLACES",db)
+def remove_google(db:Session=Depends(get_db), admin: dict = Depends(require_admin)): return disconnect_integration("GOOGLE_PLACES",db,admin)
 @app.post("/api/v1/admin/integrations/google-places/test")
-async def test_google(db:Session=Depends(get_db)):
+async def test_google(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     item=db.query(Integration).filter_by(provider="GOOGLE_PLACES").first()
     try:
         await google_provider(db).search("restaurant",1)
@@ -392,17 +937,37 @@ async def start_call(lead_id:int, data:CallStartIn, db:Session=Depends(get_db)):
         raise HTTPException(404, detail="Lead not found")
     config = db.query(VoiceAgentConfig).first()
     provider = LocalVoiceAgentProvider(config)
-    if provider.status == "NOT_CONFIGURED":
+    contact_profile = _contact_profile_settings(db)
+    caller_id = str(data.caller_id or contact_profile.get("contact.voice_phone", "")).strip()
+    to_number = str(data.to_number or contact_profile.get("contact.voice_phone", "")).strip()
+
+    if not caller_id and not to_number and provider.status == "NOT_CONFIGURED":
         raise HTTPException(503, detail="VOICE_AGENT_NOT_CONFIGURED")
-    item = Call(lead_id=lead_id, customer_id=None, status="QUEUED", provider_reference=data.agent_name or config.name or "local_voice_agent", result="{}", error="")
+
+    item = Call(
+        lead_id=lead_id,
+        customer_id=None,
+        status="QUEUED",
+        provider_reference=data.agent_name or config.name if config else "local_voice_agent",
+        result="{}",
+        error="",
+        from_number=caller_id,
+        to_number=to_number,
+    )
     db.add(item); db.flush()
     try:
-        payload = await provider.start_call(lead_id, data.caller_id or "")
+        payload = await provider.start_call(lead_id, caller_id, to_number=to_number)
         item.status = "CONNECTED"
         item.result = json.dumps(payload)
-        item.provider_reference = payload.get("provider_reference", item.provider_reference)
+        item.provider_reference = str(payload.get("provider_reference", item.provider_reference))
+        item.from_number = caller_id
+        item.to_number = to_number
+        item.provider_data = json.dumps(payload)
+        item.recording_url = str(payload.get("recording_url") or payload.get("recordingUrl") or "")
+        item.transcript = str(payload.get("transcript") or "")
+        item.started_at = datetime.now(timezone.utc)
         lead.lifecycle = "CALLED"
-        db.add(TimelineEvent(lead_id=lead.id, event_type="CALL_STARTED", detail=f"Caller: {data.caller_id or 'local'}"))
+        db.add(TimelineEvent(lead_id=lead.id, event_type="CALL_STARTED", detail=f"Caller: {caller_id or 'local'} -> To: {to_number or 'local'}"))
         db.commit(); db.refresh(item)
         return item
     except (httpx.HTTPError, ValueError) as exc:
@@ -411,6 +976,37 @@ async def start_call(lead_id:int, data:CallStartIn, db:Session=Depends(get_db)):
         db.add(TimelineEvent(lead_id=lead.id, event_type="CALL_FAILED", detail=str(exc)))
         db.commit(); db.refresh(item)
         raise HTTPException(503, detail="VOICE_AGENT_OFFLINE") from exc
+
+
+@app.post("/api/v1/webhooks/voice/{call_id}")
+async def voice_call_webhook(call_id: int, request: Request, db: Session = Depends(get_db)):
+    raw_body = await request.body()
+    signature = request.headers.get("X-LeadPilot-Signature", "")
+    if settings.webhook_signing_secret:
+        expected = "sha256=" + hmac.new(settings.webhook_signing_secret.encode(), raw_body, hashlib.sha256).hexdigest()
+        if not signature or not hmac.compare_digest(signature, expected):
+            raise HTTPException(status_code=401, detail="INVALID_WEBHOOK_SIGNATURE")
+    elif not settings.development_mode:
+        raise HTTPException(status_code=503, detail="WEBHOOK_SIGNING_SECRET_NOT_CONFIGURED")
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="INVALID_WEBHOOK_JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="WEBHOOK_PAYLOAD_MUST_BE_OBJECT")
+    item = db.get(Call, call_id)
+    if not item:
+        raise HTTPException(404, detail="CALL_NOT_FOUND")
+    item.provider_data = json.dumps(payload)
+    status = str(payload.get("status") or "COMPLETED").upper()
+    item.status = CallStatus(status) if status in {member.value for member in CallStatus} else CallStatus.COMPLETED
+    item.recording_url = str(payload.get("recording_url") or payload.get("recordingUrl") or item.recording_url or "")
+    item.transcript = str(payload.get("transcript") or item.transcript or "")
+    item.duration_seconds = int(payload.get("duration_seconds") or payload.get("duration") or item.duration_seconds or 0)
+    item.ended_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(item)
+    return item
 
 
 @app.post("/api/v1/leads/{lead_id}/customer",status_code=201)
@@ -464,7 +1060,8 @@ def campaign_items(campaign_id:int, db:Session=Depends(get_db)):
 
 @app.post("/api/v1/campaigns",status_code=201)
 def create_campaign(data:CampaignIn,db:Session=Depends(get_db)):
-    if not data.sender_account: raise HTTPException(422,detail="Select a connected user sender account")
+    if not data.sender_account.strip(): raise HTTPException(422,detail="Select a connected user sender account")
+    if not data.lead_ids: raise HTTPException(422,detail="Select at least one lead")
     campaign=Campaign(name=data.name,channel=data.channel,sender_account=data.sender_account,instruction_profile_id=data.instruction_profile_id); db.add(campaign); db.flush()
     for lead_id in data.lead_ids:
         if db.get(Lead,lead_id): db.add(CampaignItem(campaign_id=campaign.id,lead_id=lead_id))
@@ -480,6 +1077,103 @@ def launch_campaign(campaign_id:int, db:Session=Depends(get_db)):
     db.add(campaign)
     db.commit()
     return {"id": campaign.id, "status": campaign.status, "items": db.query(CampaignItem).filter_by(campaign_id=campaign_id).count()}
+
+
+def _campaign_draft(lead: Lead, profile: InstructionProfile | None, service: ServiceProfile | None, outreach: dict[str, Any], db: Session):
+    audit = db.query(WebsiteAudit).filter_by(business_id=lead.business_id).first()
+    has_website = bool(lead.business.website)
+    evidence = json.loads(audit.evidence).get("reasons", []) if audit else json.loads(lead.score_reasons or "[]")
+    if has_website:
+        evidence.append(f"Website reviewed: {lead.business.website}")
+        opening_context = "The outreach references the recipient's existing website and its visible improvement opportunities."
+    else:
+        evidence.append("No website is recorded for this business")
+        opening_context = "The outreach offers a first website conversation because no website is recorded."
+    links = list(outreach.get("portfolio_urls", [])) + list(outreach.get("reference_websites", []))
+    if links:
+        evidence.append("Portfolio and reference links: " + ", ".join(str(link) for link in links))
+    draft = MessageComposerEngine().compose(
+        profile=profile,
+        business_name=lead.business.business_name,
+        offer=profile.offer if profile else service.offer if service else "",
+        service_summary=(service.services if service else "") + " " + opening_context,
+        cta=profile.cta if profile else outreach.get("default_cta", "Would you like a quick, no-pressure review?"),
+        evidence=evidence,
+        tone=profile.tone if profile else service.preferred_tone if service else "Professional",
+        niche=profile.niche if profile else lead.business.category or "local business",
+    )
+    return draft
+
+
+@app.post("/api/v1/campaigns/{campaign_id}/prepare")
+def prepare_campaign(campaign_id: int, data: CampaignPrepareIn, db: Session = Depends(get_db)):
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, detail="Campaign not found")
+    if not data.lead_ids:
+        raise HTTPException(422, detail="Select at least one lead")
+    selected = set(data.lead_ids)
+    items = db.query(CampaignItem).filter_by(campaign_id=campaign_id).all()
+    if not selected.issubset({item.lead_id for item in items}):
+        raise HTTPException(422, detail="Selected lead is not part of this campaign")
+    profile = db.get(InstructionProfile, campaign.instruction_profile_id) if campaign.instruction_profile_id else db.query(InstructionProfile).filter_by(active=True).first()
+    service = db.query(ServiceProfile).first()
+    outreach = _outreach_profile(db)
+    previews = []
+    for item in items:
+        if selected and item.lead_id not in selected:
+            continue
+        if item.status in {"SENT", "DELIVERED"}:
+            continue
+        lead = db.get(Lead, item.lead_id)
+        if not lead:
+            continue
+        draft = _campaign_draft(lead, profile, service, outreach, db)
+        previews.append({"lead_id": lead.id, "business_name": lead.business.business_name, "website": lead.business.website, "recipient": lead.business.phone or "", "subject": draft.subject, "body": draft.body, "status": item.status})
+        item.status = "PREPARED"
+    db.commit()
+    return {"campaign_id": campaign_id, "count": len(previews), "previews": previews, "send_once_guard": True}
+
+
+@app.post("/api/v1/campaigns/{campaign_id}/send-selected")
+async def send_selected_campaign(campaign_id: int, data: CampaignSendIn, db: Session = Depends(get_db)):
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, detail="Campaign not found")
+    channel = (data.channel or campaign.channel).strip().upper()
+    profile = db.get(InstructionProfile, campaign.instruction_profile_id) if campaign.instruction_profile_id else db.query(InstructionProfile).filter_by(active=True).first()
+    service_profile = db.query(ServiceProfile).first()
+    outreach = _outreach_profile(db)
+    provider = MessageProviderFactory.create(channel)
+    service = OutboundMessageService(db)
+    selected = set(data.lead_ids)
+    campaign_lead_ids = {item.lead_id for item in db.query(CampaignItem).filter_by(campaign_id=campaign_id).all()}
+    if not selected.issubset(campaign_lead_ids):
+        raise HTTPException(422, detail="Selected lead is not part of this campaign")
+    results = []
+    for item in db.query(CampaignItem).filter_by(campaign_id=campaign_id).all():
+        if item.lead_id not in selected or item.status in {"SENT", "DELIVERED"}:
+            continue
+        lead = db.get(Lead, item.lead_id)
+        if not lead or not lead.business.phone:
+            results.append({"lead_id": item.lead_id, "status": "SKIPPED", "reason": "NO_RECIPIENT"})
+            continue
+        draft = _campaign_draft(lead, profile, service_profile, outreach, db)
+        outbound, created = service.get_or_create(
+            idempotency_key=f"campaign:{campaign_id}:lead:{lead.id}:{channel}",
+            channel=channel,
+            body=draft.body,
+            recipient=lead.business.phone,
+            subject=draft.subject,
+            lead_id=lead.id,
+            campaign_id=campaign_id,
+        )
+        if created:
+            outbound = await service.send_once(provider, message=outbound, context={"subject": draft.subject})
+        item.status = "SENT" if outbound.status in {OutboundMessageStatus.SENT, OutboundMessageStatus.DELIVERED} else "FAILED"
+        results.append({"lead_id": lead.id, "status": item.status, "error": outbound.error})
+    db.commit()
+    return {"campaign_id": campaign_id, "channel": channel, "results": results, "send_once_guard": True}
 
 
 @app.patch("/api/v1/campaigns/{campaign_id}")
@@ -499,14 +1193,14 @@ async def save_audit(business_id:int,db:Session=Depends(get_db)):
     record=db.query(WebsiteAudit).filter_by(business_id=business_id).first() or WebsiteAudit(business_id=business_id)
     record.status=result["classification"];record.evidence=json.dumps(result);db.add(record);db.commit();return result
 @app.get("/api/v1/admin/service-profile")
-def get_service_profile(db:Session=Depends(get_db)):return db.query(ServiceProfile).first() or {}
+def get_service_profile(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):return db.query(ServiceProfile).first() or {}
 @app.put("/api/v1/admin/service-profile")
-def save_service_profile(data:ServiceIn,db:Session=Depends(get_db)):
+def save_service_profile(data:ServiceIn,db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     item=db.query(ServiceProfile).first() or ServiceProfile()
     for key,value in data.model_dump().items():setattr(item,key,value)
     db.add(item);db.commit();db.refresh(item);return item
 @app.get("/api/v1/admin/instructions/{profile_id}/test")
-def test_instruction_profile(profile_id:int, db:Session=Depends(get_db)):
+def test_instruction_profile(profile_id:int, db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     profile = db.get(InstructionProfile, profile_id)
     if not profile: raise HTTPException(404, detail="Instruction profile not found")
     composer = MessageComposerEngine()
@@ -524,7 +1218,7 @@ def test_instruction_profile(profile_id:int, db:Session=Depends(get_db)):
 
 
 @app.post("/api/v1/admin/instructions/{profile_id}/activate")
-def activate_instruction_profile(profile_id:int, db:Session=Depends(get_db)):
+def activate_instruction_profile(profile_id:int, db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     profile = db.get(InstructionProfile, profile_id)
     if not profile: raise HTTPException(404, detail="Instruction profile not found")
     for row in db.query(InstructionProfile).all():
@@ -536,7 +1230,7 @@ def activate_instruction_profile(profile_id:int, db:Session=Depends(get_db)):
 
 
 @app.post("/api/v1/admin/instructions/{profile_id}/duplicate")
-def duplicate_instruction_profile(profile_id:int, db:Session=Depends(get_db)):
+def duplicate_instruction_profile(profile_id:int, db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     profile = db.get(InstructionProfile, profile_id)
     if not profile: raise HTTPException(404, detail="Instruction profile not found")
     clone = InstructionProfile(
@@ -588,6 +1282,58 @@ def approve_message(message_id:int,db:Session=Depends(get_db)):
     if not message:raise HTTPException(404,detail="Message not found")
     if message.status!="DRAFT":raise HTTPException(409,detail="Only drafts can be approved")
     message.status="APPROVED";db.commit();db.refresh(message);return message
+
+
+@app.post("/api/v1/messages/send", status_code=201)
+async def send_message(data: MessageSendIn, db: Session = Depends(get_db)):
+    """Deliver a message through a Python provider and persist the complete attempt."""
+    channel = data.channel.strip().upper()
+    try:
+        provider = MessageProviderFactory.create(channel)
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+
+    service = OutboundMessageService(db)
+    message, created = service.get_or_create(
+        idempotency_key=data.idempotency_key,
+        channel=channel,
+        body=data.body,
+        recipient=data.recipient,
+        subject=data.subject,
+        lead_id=data.lead_id,
+        campaign_id=data.campaign_id,
+    )
+    if created:
+        message = await service.send_once(
+            provider,
+            message=message,
+            context={"subject": data.subject},
+        )
+    return {
+        "id": message.id,
+        "channel": message.channel,
+        "recipient": message.recipient,
+        "status": message.status.value if hasattr(message.status, "value") else message.status,
+        "provider_message_id": message.provider_message_id,
+        "error": message.error,
+        "idempotent_replay": not created,
+    }
+
+
+@app.post("/api/v1/voice/agent/respond")
+async def voice_agent_respond(data: VoiceAgentTurnIn):
+    """Run one conversation turn in the Python voice brain without a cloud model."""
+    brain = voice_brains.setdefault(data.conversation_id or "default", RuleBrain())
+    response_text = await brain.respond(data.text)
+    return {
+        "conversation_id": data.conversation_id or "default",
+        "transcript": data.text,
+        "response_text": response_text,
+        "engine": "PYTHON_RULE_BRAIN",
+        "status": "READY",
+    }
+
+
 @app.post("/api/v1/leads/{lead_id}/personalize",status_code=201)
 def personalize(lead_id:int,data:DraftIn,db:Session=Depends(get_db)):
     """Explicit traceable pipeline: all returned context is persisted application data."""

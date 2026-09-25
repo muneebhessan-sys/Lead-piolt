@@ -1,0 +1,92 @@
+:root {
+  --color-bg: #0a0a0f;
+  --color-bg-elevated: #11131a;
+  --color-surface: #161922;
+  --color-surface-hover: #1d212c;
+  --color-border: #2a2f3e;
+  --color-border-strong: #3a4055;
+  --color-text-primary: #f0f2f5;
+  --color-text-secondary: #a8adb8;
+  --color-text-muted: #6b7280;
+  --color-accent: #00d4aa;
+  --color-accent-dim: #00d4aa33;
+  --color-accent-strong: #00e8bb;
+  --color-warn: #f5a623;
+  --color-warn-dim: #f5a62333;
+  --color-error: #ff4757;
+  --color-error-dim: #ff475733;
+  --color-info: #4a9eff;
+  --color-info-dim: #4a9eff33;
+
+  --glass-bg: rgba(22, 25, 34, 0.7);
+  --glass-border: rgba(58, 64, 85, 0.5);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --glass-shadow-hover: 0 12px 40px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+
+  --sidebar-width: 280px;
+  --sidebar-collapsed-width: 72px;
+  --header-height: 64px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+
+  --transition-fast: 120ms ease;
+  --transition-base: 200ms ease;
+  --transition-slow: 300ms ease;
+
+  --font-sans: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.4);
+  --shadow-glow: 0 0 24px rgba(0, 212, 170, 0.15);
+
+  --z-bg: 0;
+  --z-content: 10;
+  --z-sidebar: 100;
+  --z-header: 200;
+  --z-modal: 300;
+  --z-tooltip: 400;
+  --z-palette: 500;
+}
+
+[data-theme="light"] {
+  --color-bg: #f8f9fc;
+  --color-bg-elevated: #ffffff;
+  --color-surface: #ffffff;
+  --color-surface-hover: #f0f2f5;
+  --color-border: #e4e7ef;
+  --color-border-strong: #d0d5e0;
+  --color-text-primary: #1a1d24;
+  --color-text-secondary: #5a5f6e;
+  --color-text-muted: #8b91a0;
+  --color-accent: #00b894;
+  --color-accent-dim: #00b89433;
+  --color-accent-strong: #00d4aa;
+  --color-warn: #e67e22;
+  --color-warn-dim: #e67e2233;
+  --color-error: #e74c3c;
+  --color-error-dim: #e74c3c33;
+  --color-info: #3498db;
+  --color-info-dim: #3498db33;
+
+  --glass-bg: rgba(255, 255, 255, 0.8);
+  --glass-border: rgba(212, 217, 230, 0.8);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --glass-shadow-hover: 0 12px 40px rgba(0, 0, 0, 0.12), inset 0 1px 0 rgba(255, 255, 255, 1);
+
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.1);
+  --shadow-glow: 0 0 24px rgba(0, 184, 148, 0.2);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --transition-fast: 0ms;
+    --transition-base: 0ms;
+    --transition-slow: 0ms;
+  }
+}

@@ -4,7 +4,7 @@
 |---|---|---|
 | FastAPI foundation | IMPLEMENTED | Health, Ollama status/models, and protected audit endpoints exist. |
 | PostgreSQL/Alembic | IMPLEMENTED, NOT CONFIGURED | Initial migration for businesses/search jobs exists; PostgreSQL was absent from PATH and migration was not run. |
-| Redis/Celery | NOT CONFIGURED | Compose service exists; worker workflows are not implemented. |
+| Redis/Celery | NOT USED | LocalJobEngine is used; Docker Compose and Redis/Celery runtime artifacts were removed. |
 | Local AI | IMPLEMENTED, NOT CONFIGURED | `LocalAIProvider` calls local Ollama only; Ollama was not found. |
 | Website audit | IMPLEMENTED | HTTP/HTTPS, title, description, H1, viewport evidence; SSRF controls included. |
 | Google discovery | NOT IMPLEMENTED | Requires credential and async worker implementation. |
