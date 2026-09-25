@@ -97,6 +97,14 @@ class DiscoveryIn(BaseModel):
 class ServiceIn(BaseModel):
     company_name:str=""; description:str=""; services:str=""; target_niches:str=""; target_locations:str=""; offer:str=""; portfolio_url:str=""; contact_information:str=""; cta:str=""; preferred_tone:str="Professional"; additional_instructions:str=""
 class DraftIn(BaseModel): instruction_profile_id:int|None=None; recipient:str=""; channel:str="EMAIL"
+class AIPreviewIn(BaseModel):
+    business_name: str = "Unknown business"
+    website: str = ""
+    website_status: str = "unknown"
+    previous_conversation: str = ""
+    custom_instruction: str = ""
+    instruction_profile_id: int | None = None
+    channel: str = "EMAIL"
 class MessageSendIn(BaseModel):
     recipient: str = Field(min_length=1, max_length=320)
     channel: str = Field(default="EMAIL", min_length=2, max_length=30)
@@ -286,6 +294,31 @@ def delete_instruction(profile_id:int,db:Session=Depends(get_db), admin: dict = 
     item=db.get(InstructionProfile,profile_id)
     if not item:raise HTTPException(404,detail="Instruction profile not found")
     db.delete(item);db.commit()
+
+@app.post("/api/v1/admin/ai-control/preview")
+def preview_ai_message(data: AIPreviewIn, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
+    profile = db.get(InstructionProfile, data.instruction_profile_id) if data.instruction_profile_id else db.query(InstructionProfile).filter_by(active=True).first()
+    if not profile:
+        raise HTTPException(422, detail="AI_INSTRUCTION_PROFILE_REQUIRED")
+    evidence = []
+    if data.website:
+        evidence.append(f"Website recorded: {data.website}")
+    if data.website_status and data.website_status.lower() != "unknown":
+        evidence.append(f"Website status: {data.website_status}")
+    context = data.previous_conversation.strip()
+    if context:
+        evidence.append(f"Previous conversation: {context[-1200:]}")
+    draft = MessageComposerEngine().compose(
+        profile=profile,
+        business_name=data.business_name.strip() or "Unknown business",
+        offer=profile.offer,
+        service_summary=profile.services,
+        cta=profile.cta,
+        evidence=evidence,
+        tone=profile.tone,
+        niche=profile.niche,
+    )
+    return {"mode": "TEST_SIMULATION", "subject": draft.subject, "body": draft.body, "profile_id": profile.id, "persisted": False}
 @app.post("/api/v1/jobs",status_code=201)
 def create_job(data:JobIn,db:Session=Depends(get_db)):return jobs.enqueue(db,data.job_type,data.payload,data.total)
 @app.get("/api/v1/jobs")
@@ -1084,6 +1117,18 @@ def list_customers(db:Session=Depends(get_db)):
 @app.get("/api/v1/calls")
 def list_calls(db:Session=Depends(get_db)):
     return db.query(Call).order_by(Call.id.desc()).limit(100).all()
+
+@app.get("/api/v1/communication-history")
+def communication_history(db: Session = Depends(get_db)):
+    messages = db.query(OutboundMessage).order_by(OutboundMessage.id.desc()).limit(100).all()
+    calls = db.query(Call).order_by(Call.id.desc()).limit(100).all()
+    history = []
+    for message in messages:
+        account = db.get(Account, message.account_id) if message.account_id else None
+        history.append({"type": "MESSAGE", "id": message.id, "lead_id": message.lead_id, "channel": message.channel, "sender_account_id": message.account_id, "sender": account.name if account else "", "provider_message_id": message.provider_message_id, "status": message.status.value if hasattr(message.status, "value") else message.status, "recipient": message.recipient, "timestamp": message.sent_at or message.created_at, "error": message.error})
+    for call in calls:
+        history.append({"type": "CALL", "id": call.id, "lead_id": call.lead_id, "channel": "PHONE", "sender_account_id": None, "sender": call.from_number, "provider_message_id": call.provider_reference, "status": call.status.value if hasattr(call.status, "value") else call.status, "recipient": call.to_number, "timestamp": call.started_at or call.created_at, "outcome": call.result, "error": call.error, "duration_seconds": call.duration_seconds})
+    return sorted(history, key=lambda item: str(item.get("timestamp") or ""), reverse=True)
 
 
 @app.post("/api/v1/leads/{lead_id}/call", status_code=201)
