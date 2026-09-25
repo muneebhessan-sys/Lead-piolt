@@ -11,6 +11,7 @@ import './styles.css';
 type Social = { platform: string; profile_url: string; username?: string | null; status: string };
 type Lead = { id: number; business: { id: number; name: string; category?: string | null; categories: string[]; location: { address?: string | null; locality?: string | null; city?: string | null; region?: string | null; country?: string | null; latitude?: string | null; longitude?: string | null }; contact: { phone?: string | null }; website?: string | null; google: { place_id?: string | null; maps_url?: string | null; rating?: string | null; review_count?: number | null; business_status?: string | null }; social_profiles: Social[] }; lifecycle: string; score: { score: number; grade: string; reasons: string[] } };
 type Integration = { provider: string; status: string; account_name: string; capabilities: string[]; configured: boolean; enabled: boolean; last_error?: string };
+type ConnectedAccount = { provider: string; id: number | null; status: string; account_name: string; capabilities: string[]; connected_at?: string | null };
 type ContactProfile = { phone_number: string; voice_phone: string; voice_phone_status: string; whatsapp_phone: string; whatsapp_phone_status: string; instagram_handle: string; facebook_handle: string; linkedin_url: string; threads_url: string; tiktok_handle: string; gmail_email: string; email_sender_name: string };
 
 async function api(path: string, init: RequestInit = {}) { const response = await fetch('/api/v1' + path, { ...init, headers: { 'Content-Type': 'application/json', ...(init.headers || {}) } }); const body = await response.json().catch(() => null); if (!response.ok) throw Error(body?.detail || body?.error || 'Request failed'); return body; }
@@ -30,12 +31,14 @@ const providerMeta: Record<string, { label: string; mark: string; color: string;
   instagram: { label: 'Instagram', mark: '◎', color: '#e1306c', oauth: 'META' },
   facebook: { label: 'Facebook', mark: 'f', color: '#1877f2', oauth: 'META' },
   linkedin: { label: 'LinkedIn', mark: 'in', color: '#0a66c2', oauth: 'LINKEDIN' },
+  x: { label: 'X', mark: 'X', color: '#111111', oauth: 'X' },
   tiktok: { label: 'TikTok', mark: '♪', color: '#00f2ea', oauth: 'TIKTOK' },
   'voice-agent': { label: 'Voice calling', mark: '☎', color: '#ffb000' },
 };
 function Integrations() {
-  const providers = ['google-places', 'gmail', 'whatsapp', 'instagram', 'facebook', 'linkedin', 'tiktok', 'voice-agent'];
+  const providers = ['google-places', 'gmail', 'whatsapp', 'instagram', 'facebook', 'tiktok', 'linkedin', 'x', 'voice-agent'];
   const [state, setState] = useState<Record<string, Integration>>({});
+  const [accounts, setAccounts] = useState<ConnectedAccount[]>([]);
   const [secret, setSecret] = useState<Record<string, string>>({});
   const [account, setAccount] = useState<Record<string, string>>({});
   const [contact, setContact] = useState<ContactProfile>({
@@ -59,6 +62,7 @@ function Integrations() {
     void Promise.allSettled(providers.map(provider => api('/admin/integrations/' + provider).then(value => setState(current => ({ ...current, [provider]: value })))))
       .then(results => { if (results.some(result => result.status === 'rejected')) setMessage('Some provider cards could not be loaded; configured cards remain available.'); });
     void api('/admin/contact-profile').then(setContact).catch(() => undefined);
+    void api('/admin/accounts').then(setAccounts).catch(error => setMessage(error instanceof Error ? error.message : 'Accounts could not be loaded'));
   }, []);
 
   const save = async (provider: string) => {
@@ -81,13 +85,24 @@ function Integrations() {
     }
   };
 
-  const connectOAuth = async (provider: string) => {
+  const connectOAuth = async (provider: string, targetProvider = provider) => {
     try {
       const redirectUri = window.location.origin + '/oauth/callback';
-      const result = await api('/admin/oauth/begin', { method: 'POST', body: JSON.stringify({ provider, redirect_uri: redirectUri }) });
+      setMessage(`Opening secure ${targetProvider} authorization...`);
+      const result = await api('/admin/oauth/begin', { method: 'POST', body: JSON.stringify({ provider, target_provider: targetProvider, redirect_uri: redirectUri }) });
       window.location.assign(result.auth_url);
     } catch (e) {
       setMessage(e instanceof Error ? e.message : 'OAuth connection could not start');
+    }
+  };
+
+  const disconnectOAuth = async (provider: string) => {
+    try {
+      await api('/admin/accounts/' + provider, { method: 'DELETE' });
+      setAccounts(current => current.map(item => item.provider === provider ? { ...item, status: 'DISCONNECTED', account_name: '', capabilities: [] } : item));
+      setMessage(`${provider} disconnected`);
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : 'Disconnect failed');
     }
   };
 
@@ -120,6 +135,18 @@ function Integrations() {
       setMessage(e instanceof Error ? e.message : 'Contact save failed');
     }
   };
+
+  return <section><h1>My Accounts</h1><p className="muted">Accounts are connected only after official provider authorization and backend verification.</p><Notice message={message}/><div className="admin-grid">
+    {providers.map(provider => {
+      const meta = providerMeta[provider];
+      const accountProvider = ['whatsapp', 'instagram', 'facebook'].includes(provider) ? 'META' : provider.toUpperCase();
+      const connected = accounts.find(item => item.provider === accountProvider);
+      const item = state[provider];
+      const isConnected = connected?.status === 'ACTIVE';
+      const oauthProvider = meta?.oauth;
+      return <article className="provider-card" key={provider}><div className="provider-heading"><span className="provider-mark" style={{ background: meta.color }}>{meta.mark}</span><div><h2>{meta.label}</h2><strong className="status">{connected?.status || item?.status || 'NOT_CONNECTED'}</strong></div></div><p>{connected?.account_name || item?.account_name || 'No verified account connected'}</p><div className="capability-list">{connected?.capabilities?.length ? connected.capabilities.map(capability => <span key={capability}>{capability}</span>) : <span>No verified capabilities</span>}</div>{oauthProvider && !isConnected && <button className="connect-button" onClick={() => void connectOAuth(oauthProvider, provider.toUpperCase())}>Connect with official {meta.label} authorization</button>}{oauthProvider && isConnected && <div className="stack-actions"><button onClick={() => void connectOAuth(oauthProvider, provider.toUpperCase())}>Reconnect</button><button onClick={() => void disconnectOAuth(accountProvider)}>Disconnect</button></div>}{!oauthProvider && <p className="muted">Configured through existing service settings.</p>}</article>;
+    })}
+  </div></section>;
 
   return <section><h1>Accounts & Integrations</h1><Notice message={message}/><div className="admin-grid">
     <article className="panel contact-panel"><h2>Your sending number</h2><p>Yehi ek number WhatsApp messaging aur voice calling dono ke liye use hoga.</p><div className="finder-form"><label>WhatsApp + voice phone<input placeholder="+923001234567" value={contact.phone_number} onChange={e => setContact({ ...contact, phone_number: e.target.value, voice_phone: e.target.value, whatsapp_phone: e.target.value })}/><span className={'verification-state ' + contact.whatsapp_phone_status}>{contact.whatsapp_phone_status}<button type="button" onClick={() => void requestPhoneVerification('whatsapp_phone')}>Request code</button></span></label><label>WhatsApp verification code<input inputMode="numeric" value={verificationCode} onChange={e => setVerificationCode(e.target.value)} placeholder="6-digit code"/><button type="button" disabled={!verificationCode} onClick={() => void confirmPhoneVerification()}>Confirm code</button></label>{(['instagram_handle', 'facebook_handle', 'linkedin_url', 'threads_url', 'tiktok_handle', 'gmail_email', 'email_sender_name'] as const).map(key => <label key={key}>{key.replace(/_/g, ' ')}<input value={contact[key]} onChange={e => setContact({ ...contact, [key]: e.target.value })}/></label>)}<button onClick={() => void saveContact()}>Save profile</button></div></article>

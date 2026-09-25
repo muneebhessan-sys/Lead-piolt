@@ -31,6 +31,17 @@ class Settings(BaseSettings):
     api_rate_limit_window: int = 60
     development_mode: bool = True
     webhook_signing_secret: str = Field(default="")
+    gmail_client_id: str = ""
+    gmail_client_secret: str = ""
+    meta_app_id: str = ""
+    meta_app_secret: str = ""
+    meta_api_version: str = "v22.0"
+    linkedin_client_id: str = ""
+    linkedin_client_secret: str = ""
+    x_client_id: str = ""
+    x_client_secret: str = ""
+    tiktok_client_id: str = ""
+    tiktok_client_secret: str = ""
 
 
 settings = Settings()

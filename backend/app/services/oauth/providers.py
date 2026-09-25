@@ -15,6 +15,7 @@ class OAuthProvider:
     scopes: list[str]
     pkce_required: bool = True
     client_id_env: str = ""
+    client_secret_env: str = ""
     redirect_uri: str = ""
     additional_auth_params: dict[str, str] = field(default_factory=dict)
 
@@ -104,6 +105,7 @@ GMAIL_PROVIDER = OAuthProvider(
     scopes=["openid", "email", "profile", "https://www.googleapis.com/auth/gmail.send"],
     pkce_required=True,
     client_id_env="GMAIL_CLIENT_ID",
+    client_secret_env="GMAIL_CLIENT_SECRET",
     redirect_uri="",
     additional_auth_params={"access_type": "offline", "prompt": "consent"},
 )
@@ -116,6 +118,7 @@ GOOGLE_PROVIDER = OAuthProvider(
     scopes=["openid", "email", "profile"],
     pkce_required=True,
     client_id_env="GOOGLE_CLIENT_ID",
+    client_secret_env="GOOGLE_CLIENT_SECRET",
     redirect_uri="",
     additional_auth_params={"access_type": "offline", "prompt": "consent"},
 )
@@ -128,6 +131,7 @@ META_PROVIDER = OAuthProvider(
     scopes=["email", "public_profile"],
     pkce_required=False,
     client_id_env="META_APP_ID",
+    client_secret_env="META_APP_SECRET",
     redirect_uri="",
     additional_auth_params={},
 )
@@ -140,6 +144,7 @@ LINKEDIN_PROVIDER = OAuthProvider(
     scopes=["openid", "profile", "email"],
     pkce_required=True,
     client_id_env="LINKEDIN_CLIENT_ID",
+    client_secret_env="LINKEDIN_CLIENT_SECRET",
     redirect_uri="",
     additional_auth_params={},
 )
@@ -152,6 +157,7 @@ X_PROVIDER = OAuthProvider(
     scopes=["tweet.read", "users.read", "offline.access"],
     pkce_required=True,
     client_id_env="X_CLIENT_ID",
+    client_secret_env="X_CLIENT_SECRET",
     redirect_uri="",
     additional_auth_params={"response_type": "code", "response_mode": "query"},
 )
@@ -164,6 +170,7 @@ TIKTOK_PROVIDER = OAuthProvider(
     scopes=["user.info.basic", "user.info.account"],
     pkce_required=True,
     client_id_env="TIKTOK_CLIENT_ID",
+    client_secret_env="TIKTOK_CLIENT_SECRET",
     redirect_uri="",
     additional_auth_params={},
 )

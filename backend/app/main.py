@@ -1,4 +1,4 @@
-import base64, hashlib, hmac, json, re, secrets, uuid
+import base64, hashlib, hmac, json, logging, re, secrets, uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,7 @@ from app.api.v1.webhooks import router as webhook_router
 from workers.dispatcher import CampaignDispatcher
 
 app = FastAPI(title="LeadPilot API", version="0.2.0")
+logger = logging.getLogger("leadpilot.oauth")
 app.include_router(webhook_router)
 app.add_middleware(CORSMiddleware, allow_origins=[settings.frontend_origin], allow_methods=["*"], allow_headers=["*"])
 
@@ -134,6 +135,7 @@ class OAuthBeginIn(BaseModel):
     redirect_uri: str = Field(min_length=1, max_length=500)
     extra_scopes: list[str] | None = None
     extra_params: dict[str, str] | None = None
+    target_provider: str | None = None
 
 class OAuthCallbackIn(BaseModel):
     code: str = Field(min_length=1)
@@ -396,7 +398,22 @@ def sender_account(db: Session, channel: str, account_id: int | None) -> Account
     if not account or account.status != "ACTIVE" or not account.access_token_encrypted:
         raise HTTPException(422, detail="SENDER_ACCOUNT_NOT_CONNECTED")
     if account.token_expires_at and account.token_expires_at <= datetime.now(timezone.utc):
-        raise HTTPException(422, detail="SENDER_ACCOUNT_EXPIRED_RECONNECT_REQUIRED")
+        if not account.refresh_token_encrypted:
+            raise HTTPException(422, detail="SENDER_ACCOUNT_EXPIRED_RECONNECT_REQUIRED")
+        try:
+            refresh_token = secret_store.decrypt(account.refresh_token_encrypted)
+            refreshed = oauth_service.refresh_tokens(account.provider, refresh_token)
+            account.access_token_encrypted = secret_store.encrypt(str(refreshed["access_token"]))
+            if refreshed.get("refresh_token"):
+                account.refresh_token_encrypted = secret_store.encrypt(str(refreshed["refresh_token"]))
+            if refreshed.get("expires_in") is not None:
+                account.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(refreshed["expires_in"]))
+            account.status = "ACTIVE"
+            db.commit()
+        except (ValueError, KeyError, TypeError) as exc:
+            account.status = "SUSPENDED"
+            db.commit()
+            raise HTTPException(422, detail="SENDER_ACCOUNT_REFRESH_FAILED_RECONNECT_REQUIRED") from exc
     if not account_capabilities(account, channel):
         raise HTTPException(422, detail=f"SENDER_ACCOUNT_CANNOT_SEND_{normalize_provider_name(channel)}")
     return account
@@ -744,6 +761,13 @@ def list_accounts(db:Session=Depends(get_db), admin: dict = Depends(require_admi
     for provider in providers:
         account_provider = "META" if provider in {"INSTAGRAM", "FACEBOOK"} else provider
         account = db.query(Account).filter_by(provider=account_provider).order_by(Account.id.desc()).first()
+        if account and provider in {"WHATSAPP", "INSTAGRAM", "FACEBOOK"}:
+            try:
+                target = json.loads(account.settings or "{}").get("oauth_target")
+            except json.JSONDecodeError:
+                target = None
+            if target != provider:
+                account = None
         accounts.append({
             "provider": provider,
             "id": account.id if account else None,
@@ -755,6 +779,21 @@ def list_accounts(db:Session=Depends(get_db), admin: dict = Depends(require_admi
             "last_error": "",
         })
     return accounts
+
+
+@app.get("/api/v1/admin/oauth/config")
+def oauth_config(admin: dict = Depends(require_admin)):
+    expected_redirect = settings.frontend_origin.rstrip("/") + "/oauth/callback"
+    return {
+        "redirect_uri": expected_redirect,
+        "providers": {
+            "GMAIL": {"client_id": bool(settings.gmail_client_id), "client_secret": bool(settings.gmail_client_secret)},
+            "META": {"app_id": bool(settings.meta_app_id), "app_secret": bool(settings.meta_app_secret), "api_version": settings.meta_api_version},
+            "LINKEDIN": {"client_id": bool(settings.linkedin_client_id), "client_secret": bool(settings.linkedin_client_secret)},
+            "X": {"client_id": bool(settings.x_client_id), "client_secret": bool(settings.x_client_secret)},
+            "TIKTOK": {"client_id": bool(settings.tiktok_client_id), "client_secret": bool(settings.tiktok_client_secret)},
+        },
+    }
 
 
 @app.put("/api/v1/admin/accounts/{provider}")
@@ -785,6 +824,8 @@ def configure_account(provider: str, data: AccountConfigureIn, db: Session = Dep
 @app.delete("/api/v1/admin/accounts/{provider}", status_code=204)
 def disconnect_account(provider: str, db: Session = Depends(get_db), admin: dict = Depends(require_admin)):
     provider_name = normalize_provider_name(provider)
+    if provider_name in {"WHATSAPP", "INSTAGRAM", "FACEBOOK"}:
+        provider_name = "META"
     accounts = db.query(Account).filter_by(provider=provider_name).all()
     for account in accounts:
         account.access_token_encrypted = ""
@@ -797,13 +838,20 @@ def disconnect_account(provider: str, db: Session = Depends(get_db), admin: dict
 @app.post("/api/v1/admin/oauth/begin")
 def begin_oauth(data: OAuthBeginIn, admin: dict = Depends(require_admin)):
     try:
+        expected_redirect = settings.frontend_origin.rstrip("/") + "/oauth/callback"
+        if data.redirect_uri.rstrip("/") != expected_redirect.rstrip("/"):
+            raise ValueError("OAUTH_REDIRECT_URI_MISMATCH")
+        target = normalize_provider_name(data.target_provider or data.provider)
+        extra_params = dict(data.extra_params or {})
+        extra_params["leadpilot_target"] = target
         return oauth_service.begin_authorization(
             data.provider,
             data.redirect_uri,
             extra_scopes=data.extra_scopes,
-            extra_params=data.extra_params,
+            extra_params=extra_params,
         )
     except ValueError as exc:
+        logger.warning("OAuth begin failed provider=%s reason=%s", data.provider, str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -813,6 +861,7 @@ def complete_oauth(data: OAuthCallbackIn, db: Session = Depends(get_db), admin: 
     if stored is None:
         raise HTTPException(status_code=400, detail="INVALID_OR_EXPIRED_STATE")
     provider = str(stored.get("provider", ""))
+    target_provider = normalize_provider_name(str(stored.get("target_provider") or provider))
     try:
         tokens = oauth_service.exchange_code(provider, data.code, data.state, validated_state=stored)
         user_id = str(admin.get("username", settings.admin_username))
@@ -823,11 +872,62 @@ def complete_oauth(data: OAuthCallbackIn, db: Session = Depends(get_db), admin: 
             profile = {}
         account_name = str(profile.get("name") or profile.get("displayName") or profile.get("email") or profile.get("username") or user_id)
         provider_user_id = str(profile.get("id") or "")
+        if provider == "META" and target_provider == "WHATSAPP":
+            graph_version = settings.meta_api_version.strip("/") or "v22.0"
+            graph_url = f"https://graph.facebook.com/{graph_version}/me/businesses"
+            with httpx.Client(timeout=settings.request_timeout) as client:
+                headers = {"Authorization": f"Bearer {tokens.get('access_token', '')}"}
+                verification = client.get(graph_url, headers=headers)
+            if verification.status_code >= 400 or not verification.json().get("data"):
+                raise ValueError("WHATSAPP_BUSINESS_ONBOARDING_REQUIRED: Meta did not return an authorized business account")
+            business = verification.json()["data"][0]
+            profile["business_id"] = str(business.get("id", ""))
+            profile["business_name"] = str(business.get("name", ""))
+            with httpx.Client(timeout=settings.request_timeout) as client:
+                waba_response = client.get(f"https://graph.facebook.com/{graph_version}/{profile['business_id']}/owned_whatsapp_business_accounts", headers=headers)
+                if waba_response.status_code >= 400 or not waba_response.json().get("data"):
+                    raise ValueError("WHATSAPP_BUSINESS_ACCOUNT_REQUIRED: No WhatsApp Business Account was returned by Meta")
+                waba = waba_response.json()["data"][0]
+                phones = client.get(f"https://graph.facebook.com/{graph_version}/{waba['id']}/phone_numbers?fields=id,display_phone_number,verified_name,status", headers=headers)
+            if phones.status_code >= 400 or not phones.json().get("data"):
+                raise ValueError("WHATSAPP_PHONE_ONBOARDING_REQUIRED: Meta returned no verified WhatsApp phone number")
+            phone = phones.json()["data"][0]
+            profile.update({"waba_id": str(waba.get("id", "")), "phone_number_id": str(phone.get("id", "")), "display_phone_number": str(phone.get("display_phone_number", "")), "phone_status": str(phone.get("status", ""))})
+        elif provider == "META" and target_provider == "INSTAGRAM":
+            graph_version = settings.meta_api_version.strip("/") or "v22.0"
+            with httpx.Client(timeout=settings.request_timeout) as client:
+                response = client.get(f"https://graph.facebook.com/{graph_version}/me/accounts?fields=id,name,instagram_business_account", headers={"Authorization": f"Bearer {tokens.get('access_token', '')}"})
+            pages = response.json().get("data", []) if response.status_code < 400 else []
+            instagram = next((page.get("instagram_business_account") for page in pages if page.get("instagram_business_account")), None)
+            if not instagram:
+                raise ValueError("INSTAGRAM_ACCOUNT_REQUIRED: Connect a supported Instagram professional account through Meta")
+            profile["instagram_business_account_id"] = str(instagram.get("id", ""))
+        elif provider == "META" and target_provider == "FACEBOOK":
+            graph_version = settings.meta_api_version.strip("/") or "v22.0"
+            with httpx.Client(timeout=settings.request_timeout) as client:
+                response = client.get(f"https://graph.facebook.com/{graph_version}/me/accounts?fields=id,name", headers={"Authorization": f"Bearer {tokens.get('access_token', '')}"})
+            pages = response.json().get("data", []) if response.status_code < 400 else []
+            if not pages:
+                raise ValueError("FACEBOOK_PAGE_REQUIRED: Meta did not return a Page managed by this account")
+            profile["page_id"] = str(pages[0].get("id", ""))
+            profile["page_name"] = str(pages[0].get("name", ""))
+        settings_data = {
+            "oauth_target": target_provider,
+            "profile": profile,
+            "phone_number_id": profile.get("phone_number_id", ""),
+            "business_account_id": profile.get("waba_id") or profile.get("instagram_business_account_id", ""),
+            "page_id": profile.get("page_id", ""),
+        }
         oauth_service.store_tokens(user_id, provider, tokens, db=db, account_name=account_name, provider_user_id=provider_user_id)
+        account = db.query(Account).filter_by(email=f"oauth:{provider.upper()}:{user_id}").first()
+        if account is not None:
+            account.settings = json.dumps(settings_data)
+            db.commit()
     except ValueError as exc:
+        logger.warning("OAuth callback failed provider=%s target=%s reason=%s", provider, target_provider, str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
-        "provider": provider,
+        "provider": target_provider,
         "status": "CONNECTED",
         "account": account_name,
         "provider_user_id": provider_user_id,

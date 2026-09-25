@@ -34,10 +34,19 @@ class OAuthService:
         code_verifier = generate_code_verifier()
         code_challenge = generate_code_challenge(code_verifier)
         StateManager.store(state, {
-            "provider": provider_name,
+            "provider": provider_name.upper(),
             "code_verifier": code_verifier,
             "redirect_uri": redirect_uri,
+            "target_provider": (extra_params or {}).get("leadpilot_target", provider_name.upper()),
         })
+        target = str((extra_params or {}).get("leadpilot_target", provider_name)).upper()
+        if provider.name == "META":
+            meta_scopes = {
+                "WHATSAPP": ["business_management", "whatsapp_business_management", "whatsapp_business_messaging"],
+                "INSTAGRAM": ["instagram_basic", "instagram_manage_messages", "pages_show_list"],
+                "FACEBOOK": ["pages_show_list", "pages_read_engagement", "pages_manage_metadata", "pages_messaging"],
+            }
+            extra_scopes = list(dict.fromkeys((extra_scopes or []) + meta_scopes.get(target, [])))
         client_id = self._resolve_client_id(provider)
         auth_url = provider.authorize_url(
             client_id=client_id,
@@ -101,12 +110,11 @@ class OAuthService:
             return
         access_token = secret_store.encrypt(str(tokens.get("access_token", "")))
         refresh_token = secret_store.encrypt(str(tokens.get("refresh_token", "")))
-        account = db.scalar(
-            select(Account).where(Account.email == user_id, Account.provider == provider_name.upper())
-        )
+        account_key = f"oauth:{provider_name.upper()}:{user_id}"
+        account = db.scalar(select(Account).where(Account.email == account_key))
         if account is None:
             account = Account(
-                email=user_id,
+                email=account_key,
                 name=account_name or user_id,
                 provider=provider_name.upper(),
             )
@@ -131,9 +139,7 @@ class OAuthService:
             return cached
         if db is None:
             return None
-        account = db.scalar(
-            select(Account).where(Account.email == user_id, Account.provider == provider_name.upper())
-        )
+        account = db.scalar(select(Account).where(Account.email == f"oauth:{provider_name.upper()}:{user_id}"))
         if account is None or not account.access_token_encrypted:
             return None
         tokens = {
@@ -168,23 +174,24 @@ class OAuthService:
 
     def _resolve_client_id(self, provider: OAuthProvider) -> str:
         """Resolve the OAuth client ID from the provider's configured environment variable."""
-        import os
         env_var = provider.client_id_env
         if not env_var:
             raise ValueError(f"No client_id_env configured for {provider.name}")
-        value = os.environ.get(env_var, "")
+        import os
+        setting_name = env_var.lower()
+        value = os.environ.get(env_var, "") or str(getattr(settings, setting_name, ""))
         if not value:
             raise ValueError(f"Missing required env var {env_var} for provider {provider.name}")
         return value
 
     def _resolve_client_secret(self, provider: OAuthProvider) -> str:
         """Resolve the OAuth client secret from the corresponding environment variable."""
-        import os
-        env_var = provider.client_id_env
+        env_var = provider.client_secret_env
         if not env_var:
-            raise ValueError(f"No client_id_env configured for {provider.name}")
-        suffix = env_var.replace("_ID", "_SECRET")
-        value = os.environ.get(suffix, "")
+            raise ValueError(f"No client_secret_env configured for {provider.name}")
+        import os
+        setting_name = env_var.lower()
+        value = os.environ.get(env_var, "") or str(getattr(settings, setting_name, ""))
         return value
 
     def _fetch_token(
