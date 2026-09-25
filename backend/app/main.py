@@ -317,6 +317,7 @@ def preview_ai_message(data: AIPreviewIn, db: Session = Depends(get_db), admin: 
         evidence=evidence,
         tone=profile.tone,
         niche=profile.niche,
+        previous_conversation=context,
     )
     return {"mode": "TEST_SIMULATION", "subject": draft.subject, "body": draft.body, "profile_id": profile.id, "persisted": False}
 @app.post("/api/v1/jobs",status_code=201)
@@ -335,11 +336,16 @@ def get_voice(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     config=db.query(VoiceAgentConfig).first()
     if not config:
         return {"status":"NOT_CONFIGURED","name":"Local voice agent","base_url":"","health_path":"/health","call_path":"/calls","enabled":False}
-    return {"id": config.id, "name": config.name, "base_url": config.base_url, "health_path": config.health_path, "call_path": config.call_path, "enabled": config.enabled, "status": LocalVoiceAgentProvider(config).status}
+    try:
+        runtime_config = json.loads(config.config or "{}")
+    except json.JSONDecodeError:
+        runtime_config = {}
+    return {"id": config.id, "name": config.name, "base_url": config.base_url, "health_path": config.health_path, "call_path": config.call_path, "config": runtime_config, "enabled": config.enabled, "status": LocalVoiceAgentProvider(config).status}
 @app.put("/api/v1/admin/voice-agent")
 def save_voice(data:VoiceIn,db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     config=db.query(VoiceAgentConfig).first() or VoiceAgentConfig()
-    for key,value in data.model_dump().items():setattr(config,key,value)
+    for key,value in data.model_dump().items():
+        setattr(config, key, json.dumps(value) if key == "config" else value)
     db.add(config);db.commit();db.refresh(config);return get_voice(db)
 
 
@@ -1157,7 +1163,13 @@ async def start_call(lead_id:int, data:CallStartIn, db:Session=Depends(get_db)):
     )
     db.add(item); db.flush()
     try:
-        payload = await provider.start_call(lead_id, caller_id, to_number=to_number)
+        voice_config = {}
+        if config and config.config:
+            try:
+                voice_config = json.loads(config.config)
+            except json.JSONDecodeError:
+                voice_config = {}
+        payload = await provider.start_call(lead_id, caller_id, to_number=to_number, context=voice_config)
         item.status = "CONNECTED"
         item.result = json.dumps(payload)
         item.provider_reference = str(payload.get("provider_reference", item.provider_reference))
@@ -1293,6 +1305,11 @@ def _campaign_draft(lead: Lead, profile: InstructionProfile | None, service: Ser
     links = list(outreach.get("portfolio_urls", [])) + list(outreach.get("reference_websites", []))
     if links:
         evidence.append("Portfolio and reference links: " + ", ".join(str(link) for link in links))
+    previous_messages = db.query(OutboundMessage).filter(OutboundMessage.lead_id == lead.id).order_by(OutboundMessage.id.desc()).limit(5).all()
+    previous_conversation = "\n".join(
+        f"{item.channel} ({item.status.value if hasattr(item.status, 'value') else item.status}): {item.body}"
+        for item in reversed(previous_messages)
+    )
     draft = MessageComposerEngine().compose(
         profile=profile,
         business_name=lead.business.business_name,
@@ -1302,6 +1319,7 @@ def _campaign_draft(lead: Lead, profile: InstructionProfile | None, service: Ser
         evidence=evidence,
         tone=profile.tone if profile else service.preferred_tone if service else "Professional",
         niche=profile.niche if profile else lead.business.category or "local business",
+        previous_conversation=previous_conversation,
     )
     return draft
 
@@ -1466,6 +1484,8 @@ def create_draft(lead_id:int,data:DraftIn,db:Session=Depends(get_db)):
     service_summary = service.services if service else ""
     instruction = " ".join(filter(None,[service.company_name if service else "",service.description if service else "",service.services if service else "",service.offer if service else "",service.cta if service else "",service.preferred_tone if service else "",service.additional_instructions if service else "",profile.offer if profile else "",profile.cta if profile else "",profile.additional_instructions if profile else ""]))
     composer = MessageComposerEngine()
+    previous_messages = db.query(OutboundMessage).filter(OutboundMessage.lead_id == lead.id).order_by(OutboundMessage.id.desc()).limit(5).all()
+    previous_conversation = "\n".join(item.body for item in reversed(previous_messages))
     draft = composer.compose(
         profile=profile,
         business_name=lead.business.business_name,
@@ -1475,6 +1495,7 @@ def create_draft(lead_id:int,data:DraftIn,db:Session=Depends(get_db)):
         evidence=evidence,
         tone=profile.tone if profile else service.preferred_tone if service else "Professional",
         niche=profile.niche if profile else "",
+        previous_conversation=previous_conversation,
     )
     content = draft.body
     message=Message(lead_id=lead.id,instruction_profile_id=profile.id if profile else None,channel=data.channel,recipient=data.recipient,subject=draft.subject,content=content,status="DRAFT")
@@ -1526,15 +1547,32 @@ async def send_message(data: MessageSendIn, db: Session = Depends(get_db)):
 
 
 @app.post("/api/v1/voice/agent/respond")
-async def voice_agent_respond(data: VoiceAgentTurnIn):
-    """Run one conversation turn in the Python voice brain without a cloud model."""
-    brain = voice_brains.setdefault(data.conversation_id or "default", RuleBrain())
+async def voice_agent_respond(data: VoiceAgentTurnIn, db: Session = Depends(get_db)):
+    """Run one local conversation turn using the saved voice instructions."""
+    conversation_id = data.conversation_id or "default"
+    config = db.query(VoiceAgentConfig).first()
+    voice_settings = {}
+    if config and config.config:
+        try:
+            voice_settings = json.loads(config.config)
+        except json.JSONDecodeError:
+            voice_settings = {}
+    brain = voice_brains.get(conversation_id)
+    if brain is None:
+        brain = RuleBrain(
+            system_instructions=str(voice_settings.get("system_instructions", "")),
+            portfolio=str(voice_settings.get("portfolio", "")),
+            pricing_rules=str(voice_settings.get("pricing_rules", "")),
+            conversation_context=str(voice_settings.get("conversation_context", "")),
+        )
+        voice_brains[conversation_id] = brain
     response_text = await brain.respond(data.text)
     return {
-        "conversation_id": data.conversation_id or "default",
+        "conversation_id": conversation_id,
         "transcript": data.text,
         "response_text": response_text,
-        "engine": "PYTHON_RULE_BRAIN",
+        "engine": "LOCAL_RULE_BRAIN_WITH_SAVED_INSTRUCTIONS",
+        "instructions_applied": bool(voice_settings),
         "status": "READY",
     }
 

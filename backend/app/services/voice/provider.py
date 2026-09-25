@@ -99,10 +99,12 @@ class LocalVoiceAgentProvider:
             raise ValueError("VOICE_BRAIN_NOT_CONFIGURED")
         return await self.brain.respond(user_text)
 
-    async def start_call(self, lead_id: int, caller_id: str | None = None, to_number: str | None = None) -> dict[str, Any]:
+    async def start_call(self, lead_id: int, caller_id: str | None = None, to_number: str | None = None, context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Initiate a call through the voice agent; raises if not configured or unavailable."""
         self._require_available()
         payload: dict[str, Any] = {"lead_id": lead_id, "caller_id": caller_id or "", "to_number": to_number or ""}
+        if context:
+            payload["voice_context"] = context
         url = self._call_endpoint()
         try:
             async with httpx.AsyncClient(timeout=settings.request_timeout) as client:
