@@ -104,19 +104,20 @@ class MessageSendIn(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=255)
     lead_id: int | None = None
     campaign_id: int | None = None
+    account_id: int | None = None
 class StatusIn(BaseModel): status: str = Field(min_length=1, max_length=30)
 class CustomerIn(BaseModel): notes: str = ""
 class ProjectIn(BaseModel): name:str=Field(min_length=1,max_length=200); description:str=""; status:str="PLANNED"; start_date:str|None=None; due_date:str|None=None; amount:int=Field(default=0,ge=0); notes:str=""
 class NoteIn(BaseModel): content:str=Field(min_length=1)
 class PaymentIn(BaseModel): amount:int=Field(ge=0); currency:str="USD"; provider:str=""; status:str="PENDING"; reference:str=""
-class CampaignIn(BaseModel): name:str=Field(min_length=1,max_length=200); channel:str="EMAIL"; sender_account:str=Field(default="",max_length=320); instruction_profile_id:int|None=None; lead_ids:list[int]=[]
+class CampaignIn(BaseModel): name:str=Field(min_length=1,max_length=200); channel:str="EMAIL"; sender_account:str=Field(default="",max_length=320); sender_account_id:int|None=None; instruction_profile_id:int|None=None; lead_ids:list[int]=[]
 class OutreachProfileIn(BaseModel):
     portfolio_urls: list[str] = []
     reference_websites: list[str] = []
     sender_name: str = ""
     default_cta: str = "Would you like a quick, no-pressure review?"
 class CampaignPrepareIn(BaseModel): lead_ids: list[int] = []
-class CampaignSendIn(BaseModel): lead_ids: list[int] = Field(min_length=1); channel: str | None = None
+class CampaignSendIn(BaseModel): lead_ids: list[int] = Field(min_length=1); channel: str | None = None; account_id: int | None = None
 class IntegrationConfigIn(BaseModel): account_name:str=""; secret_value:str=""; enabled:bool=True
 class AdminSettingIn(BaseModel): key: str = Field(min_length=1, max_length=120); value: str = ""; protected: bool = False
 class ThemeIn(BaseModel): theme: str = "OBSIDIAN"; reduced_motion: bool = False
@@ -351,12 +352,7 @@ def integration_status(db: Session, provider: str) -> dict:
     account = db.query(Account).filter_by(provider=account_provider).order_by(Account.id.desc()).first()
     result = safe_integration(item or Integration(provider=provider), provider)
     if account and account.status == "ACTIVE" and account.access_token_encrypted:
-        capabilities = {
-            "GMAIL": ["gmail", "email", "oauth_profile"],
-            "META": ["instagram", "facebook", "oauth_profile"],
-            "LINKEDIN": ["linkedin", "oauth_profile"],
-            "TIKTOK": ["tiktok", "oauth_profile"],
-        }.get(account_provider, ["oauth_profile"])
+        capabilities = account_capabilities(account, provider)
         result.update({
             "status": "CONNECTED",
             "account_name": account.name or account.email,
@@ -366,6 +362,64 @@ def integration_status(db: Session, provider: str) -> dict:
             "last_error": "",
         })
     return result
+
+
+def account_capabilities(account: Account, channel: str | None = None) -> list[str]:
+    """Return only capabilities backed by this account's stored configuration."""
+    try:
+        settings_data = json.loads(account.settings or "{}")
+    except json.JSONDecodeError:
+        settings_data = {}
+    provider = (account.provider or "").upper()
+    capabilities = ["profile"]
+    if provider == "GMAIL":
+        capabilities.append("email")
+    elif provider == "META":
+        if settings_data.get("phone_number_id"):
+            capabilities.append("whatsapp_messaging")
+        if settings_data.get("business_account_id"):
+            capabilities.append("instagram_messaging")
+        if settings_data.get("page_access_token"):
+            capabilities.append("facebook_messaging")
+    if channel:
+        normalized = normalize_provider_name(channel)
+        aliases = {"EMAIL": "email", "GMAIL": "email", "WHATSAPP": "whatsapp_messaging", "INSTAGRAM": "instagram_messaging", "FACEBOOK": "facebook_messaging"}
+        required = aliases.get(normalized, normalized.lower() + "_messaging")
+        return [required] if required in capabilities else []
+    return capabilities
+
+
+def sender_account(db: Session, channel: str, account_id: int | None) -> Account:
+    if account_id is None:
+        raise HTTPException(422, detail="SENDER_ACCOUNT_REQUIRED")
+    account = db.get(Account, account_id)
+    if not account or account.status != "ACTIVE" or not account.access_token_encrypted:
+        raise HTTPException(422, detail="SENDER_ACCOUNT_NOT_CONNECTED")
+    if account.token_expires_at and account.token_expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(422, detail="SENDER_ACCOUNT_EXPIRED_RECONNECT_REQUIRED")
+    if not account_capabilities(account, channel):
+        raise HTTPException(422, detail=f"SENDER_ACCOUNT_CANNOT_SEND_{normalize_provider_name(channel)}")
+    return account
+
+
+def provider_for_account(channel: str, account: Account):
+    provider_channel = normalize_provider_name(channel)
+    token = secret_store.decrypt(account.access_token_encrypted)
+    try:
+        settings_data = json.loads(account.settings or "{}")
+    except json.JSONDecodeError:
+        settings_data = {}
+    kwargs: dict[str, Any] = {}
+    if provider_channel in {"EMAIL", "GMAIL"}:
+        provider_channel = "GMAIL"
+        kwargs["access_token"] = token
+    elif provider_channel == "WHATSAPP":
+        kwargs.update(token=token, phone_number_id=settings_data.get("phone_number_id", ""), business_account_id=settings_data.get("business_account_id", ""))
+    elif provider_channel == "INSTAGRAM":
+        kwargs.update(access_token=token, business_account_id=settings_data.get("business_account_id", ""))
+    elif provider_channel == "FACEBOOK":
+        kwargs["page_access_token"] = settings_data.get("page_access_token", token)
+    return MessageProviderFactory.create(provider_channel, **kwargs)
 
 
 def _contact_profile_settings(db: Session) -> dict[str, str]:
@@ -686,19 +740,21 @@ def list_integrations(db:Session=Depends(get_db), admin: dict = Depends(require_
 @app.get("/api/v1/admin/accounts")
 def list_accounts(db:Session=Depends(get_db), admin: dict = Depends(require_admin)):
     providers=["GOOGLE_PLACES","GMAIL","WHATSAPP","INSTAGRAM","FACEBOOK","LINKEDIN","X","TIKTOK","VOICE_AGENT","PAYMENTS"]
-    return [{
-        "provider": provider,
-        "status": ((db.query(Account).filter_by(provider=provider).order_by(Account.id.desc()).first()).status.value
-                   if db.query(Account).filter_by(provider=provider).first() else "NOT_CONFIGURED"),
-        "account_name": ((db.query(Account).filter_by(provider=provider).order_by(Account.id.desc()).first()).name
-                         if db.query(Account).filter_by(provider=provider).first() else ""),
-        "account_id": ((db.query(Account).filter_by(provider=provider).order_by(Account.id.desc()).first()).provider_user_id
-                       if db.query(Account).filter_by(provider=provider).first() else ""),
-        "capabilities": [],
-        "connected_at": ((db.query(Account).filter_by(provider=provider).order_by(Account.id.desc()).first()).last_login_at
-                         if db.query(Account).filter_by(provider=provider).first() else None),
-        "last_error": "",
-    } for provider in providers]
+    accounts = []
+    for provider in providers:
+        account_provider = "META" if provider in {"INSTAGRAM", "FACEBOOK"} else provider
+        account = db.query(Account).filter_by(provider=account_provider).order_by(Account.id.desc()).first()
+        accounts.append({
+            "provider": provider,
+            "id": account.id if account else None,
+            "status": account.status.value if account else "NOT_CONFIGURED",
+            "account_name": account.name if account else "",
+            "account_id": account.provider_user_id if account else "",
+            "capabilities": account_capabilities(account, provider) if account else [],
+            "connected_at": account.last_login_at if account else None,
+            "last_error": "",
+        })
+    return accounts
 
 
 @app.put("/api/v1/admin/accounts/{provider}")
@@ -1060,9 +1116,9 @@ def campaign_items(campaign_id:int, db:Session=Depends(get_db)):
 
 @app.post("/api/v1/campaigns",status_code=201)
 def create_campaign(data:CampaignIn,db:Session=Depends(get_db)):
-    if not data.sender_account.strip(): raise HTTPException(422,detail="Select a connected user sender account")
+    account = sender_account(db, data.channel, data.sender_account_id)
     if not data.lead_ids: raise HTTPException(422,detail="Select at least one lead")
-    campaign=Campaign(name=data.name,channel=data.channel,sender_account=data.sender_account,instruction_profile_id=data.instruction_profile_id); db.add(campaign); db.flush()
+    campaign=Campaign(name=data.name,channel=data.channel,sender_account_id=account.id,sender_account=account.name,instruction_profile_id=data.instruction_profile_id); db.add(campaign); db.flush()
     for lead_id in data.lead_ids:
         if db.get(Lead,lead_id): db.add(CampaignItem(campaign_id=campaign.id,lead_id=lead_id))
     db.commit(); db.refresh(campaign); return campaign
@@ -1144,7 +1200,8 @@ async def send_selected_campaign(campaign_id: int, data: CampaignSendIn, db: Ses
     profile = db.get(InstructionProfile, campaign.instruction_profile_id) if campaign.instruction_profile_id else db.query(InstructionProfile).filter_by(active=True).first()
     service_profile = db.query(ServiceProfile).first()
     outreach = _outreach_profile(db)
-    provider = MessageProviderFactory.create(channel)
+    account = sender_account(db, channel, data.account_id or campaign.sender_account_id)
+    provider = provider_for_account(channel, account)
     service = OutboundMessageService(db)
     selected = set(data.lead_ids)
     campaign_lead_ids = {item.lead_id for item in db.query(CampaignItem).filter_by(campaign_id=campaign_id).all()}
@@ -1167,6 +1224,7 @@ async def send_selected_campaign(campaign_id: int, data: CampaignSendIn, db: Ses
             subject=draft.subject,
             lead_id=lead.id,
             campaign_id=campaign_id,
+            account_id=account.id,
         )
         if created:
             outbound = await service.send_once(provider, message=outbound, context={"subject": draft.subject})
@@ -1288,8 +1346,9 @@ def approve_message(message_id:int,db:Session=Depends(get_db)):
 async def send_message(data: MessageSendIn, db: Session = Depends(get_db)):
     """Deliver a message through a Python provider and persist the complete attempt."""
     channel = data.channel.strip().upper()
+    account = sender_account(db, channel, data.account_id)
     try:
-        provider = MessageProviderFactory.create(channel)
+        provider = provider_for_account(channel, account)
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
 
@@ -1302,6 +1361,7 @@ async def send_message(data: MessageSendIn, db: Session = Depends(get_db)):
         subject=data.subject,
         lead_id=data.lead_id,
         campaign_id=data.campaign_id,
+        account_id=account.id,
     )
     if created:
         message = await service.send_once(
